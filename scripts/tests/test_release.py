@@ -6,7 +6,6 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
-import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import release
@@ -26,20 +25,21 @@ class ArchiveTests(unittest.TestCase):
                     (prefix + "README.md", b"usage"), (prefix + "LICENSE", b"license")]
         if extra is not None:
             contents.append((extra, b"unexpected"))
-        if "windows" in target:
-            with zipfile.ZipFile(path, "w") as archive:
-                for name, data in contents:
-                    archive.writestr(name, data)
-        else:
-            with tarfile.open(path, "w:gz") as archive:
-                for name, data in contents:
-                    member = tarfile.TarInfo(name)
-                    member.size = len(data)
-                    member.mode = 0o755 if executable else 0o644
-                    archive.addfile(member, io.BytesIO(data))
+        with tarfile.open(path, "w:gz") as archive:
+            for name, data in contents:
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                member.mode = 0o755 if executable else 0o644
+                archive.addfile(member, io.BytesIO(data))
         return path
 
-    def test_extracts_only_expected_binary_for_all_formats(self):
+    def test_releases_only_macos_archives(self):
+        self.assertTrue(release.TARGETS)
+        for target in release.TARGETS:
+            self.assertTrue(target.endswith("-apple-darwin"))
+            self.assertTrue(self.info.archive_name(target).endswith(".tar.gz"))
+
+    def test_extracts_only_expected_binary_for_all_targets(self):
         for target in release.TARGETS:
             with self.subTest(target=target):
                 archive = self.archive(target)
@@ -110,8 +110,42 @@ class ArchiveTests(unittest.TestCase):
     def test_foreign_target_does_not_execute_archive(self):
         with patch.object(release, "native_target", return_value=release.TARGETS[0]), patch.object(release, "smoke") as smoke:
             with self.assertRaisesRegex(ValueError, "native runner"):
-                release.verify_archive(self.root / "foreign.zip", self.info, release.TARGETS[-1])
+                release.verify_archive(self.root / "foreign.tar.gz", self.info, release.TARGETS[-1])
             smoke.assert_not_called()
+
+
+class NotesTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.changelog = Path(self.temporary.name) / "CHANGELOG.md"
+        self.info = release.Identity("tool", "0.2.0", "https://github.com/example/tool", Path("target"))
+
+    def test_takes_only_this_version_section_and_adds_install(self):
+        self.changelog.write_text(
+            "# Changelog\n\n## [Unreleased]\n\n- next\n\n"
+            "## [0.2.0] - 2026-10-06\n\n### Added\n\n- second\n\n"
+            "## [0.1.0] - 2026-10-01\n\n- first\n"
+        )
+        notes = release.notes(release.Identity("tool", "0.1.0", self.info.repository, Path("target")), self.changelog)
+        self.assertTrue(notes.startswith("- first\n\n## Install"))
+        self.changelog.write_text(self.changelog.read_text() + "\n[0.1.0]: https://example.invalid/v0.1.0\n")
+        notes = release.notes(release.Identity("tool", "0.1.0", self.info.repository, Path("target")), self.changelog)
+        self.assertNotIn("example.invalid", notes)
+        notes = release.notes(self.info, self.changelog)
+        self.assertTrue(notes.startswith("### Added\n\n- second\n\n## Install"))
+        self.assertNotIn("first", notes)
+        self.assertNotIn("next", notes)
+        self.assertIn("example/tool/v0.2.0/install.sh", notes)
+        self.assertIn("AGENTWARDEN_VERSION=v0.2.0", notes)
+
+    def test_missing_or_empty_section_is_refused(self):
+        self.changelog.write_text("# Changelog\n\n## [0.1.0] - 2026-10-01\n\n- first\n")
+        with self.assertRaisesRegex(ValueError, "no section for 0.2.0"):
+            release.notes(self.info, self.changelog)
+        self.changelog.write_text("## [0.2.0] - 2026-10-06\n\n## [0.1.0]\n- first\n")
+        with self.assertRaisesRegex(ValueError, "empty"):
+            release.notes(self.info, self.changelog)
 
 
 class TagTests(unittest.TestCase):

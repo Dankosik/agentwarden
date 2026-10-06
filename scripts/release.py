@@ -8,18 +8,15 @@ import json
 from pathlib import Path
 import re
 import shutil
-import stat
 import subprocess
 import tarfile
 import tempfile
-import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# agentwarden supports macOS only; other platforms build but refuse to run.
 TARGETS = (
-    "x86_64-unknown-linux-gnu",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
-    "x86_64-pc-windows-msvc",
 )
 OPTIONAL_NOTICES = ("NOTICE", "THIRD_PARTY_NOTICES", "THIRD_PARTY_NOTICES.md")
 
@@ -35,11 +32,10 @@ class Identity:
         return f"{self.binary}-{self.version}-{target}"
 
     def executable(self, target):
-        return self.binary + (".exe" if "windows" in target else "")
+        return self.binary
 
     def archive_name(self, target):
-        suffix = ".zip" if "windows" in target else ".tar.gz"
-        return self.archive_root(target) + suffix
+        return self.archive_root(target) + ".tar.gz"
 
 
 def run_text(command):
@@ -128,28 +124,15 @@ def inspect_archive(archive, info, target, destination=None):
         for name, regular, mode in members:
             if not regular:
                 raise ValueError(f"archive member is not a regular file: {name}")
-            if name == executable and "windows" not in target and not mode & 0o111:
+            if name == executable and not mode & 0o111:
                 raise ValueError("archive binary has lost its executable permission")
 
-    if "windows" in target:
-        with zipfile.ZipFile(archive) as source:
-            members = source.infolist()
-            check_members([
-                (member.filename,
-                 not member.is_dir() and stat.S_IFMT(member.external_attr >> 16) in (0, stat.S_IFREG),
-                 member.external_attr >> 16)
-                for member in members
-            ])
-            if destination:
-                with source.open(executable) as content, destination.open("wb") as output:
-                    shutil.copyfileobj(content, output)
-    else:
-        with tarfile.open(archive, "r:gz") as source:
-            members = source.getmembers()
-            check_members([(member.name, member.isfile(), member.mode) for member in members])
-            if destination:
-                with source.extractfile(executable) as content, destination.open("wb") as output:
-                    shutil.copyfileobj(content, output)
+    with tarfile.open(archive, "r:gz") as source:
+        members = source.getmembers()
+        check_members([(member.name, member.isfile(), member.mode) for member in members])
+        if destination:
+            with source.extractfile(executable) as content, destination.open("wb") as output:
+                shutil.copyfileobj(content, output)
     if destination:
         destination.chmod(0o755)
 
@@ -179,14 +162,9 @@ def package(info, target, dist):
     with tempfile.TemporaryDirectory(prefix="cli-package-", dir=dist) as temporary:
         candidate = Path(temporary) / archive.name
         prefix = info.archive_root(target) + "/"
-        if "windows" in target:
-            with zipfile.ZipFile(candidate, "w", compression=zipfile.ZIP_DEFLATED) as output:
-                for path, name in files:
-                    output.write(path, prefix + name)
-        else:
-            with tarfile.open(candidate, "w:gz") as output:
-                for path, name in files:
-                    output.add(path, arcname=prefix + name, recursive=False)
+        with tarfile.open(candidate, "w:gz") as output:
+            for path, name in files:
+                output.add(path, arcname=prefix + name, recursive=False)
         verify_archive(candidate, info, target)
         candidate.replace(archive)
     print(archive)
@@ -215,6 +193,31 @@ def checksums(info, dist):
     print(destination)
 
 
+def notes(info, changelog):
+    """The changelog section of this version, followed by the install command."""
+    text = changelog.read_text(encoding="utf-8")
+    heading = re.search(rf"^## \[{re.escape(info.version)}\][^\n]*\n", text, re.MULTILINE)
+    if not heading:
+        raise ValueError(f"{changelog.name} has no section for {info.version}")
+    following = re.search(r"^## ", text[heading.end():], re.MULTILINE)
+    body = text[heading.end():heading.end() + following.start() if following else None]
+    # Link reference definitions belong to the changelog file, not the release page.
+    body = re.sub(r"^\[[^\]]+\]: \S+\n?", "", body, flags=re.MULTILINE).strip()
+    if not body:
+        raise ValueError(f"{changelog.name} section for {info.version} is empty")
+    owner_repo = info.repository.removeprefix("https://github.com/").rstrip("/")
+    install = (
+        "## Install or upgrade\n\n"
+        "```sh\n"
+        f"curl -fsSL https://raw.githubusercontent.com/{owner_repo}/v{info.version}/install.sh"
+        f" | AGENTWARDEN_VERSION=v{info.version} sh\n"
+        "```\n\n"
+        "Archives are for macOS on Apple Silicon (`aarch64-apple-darwin`) and Intel "
+        "(`x86_64-apple-darwin`); `SHA256SUMS` lists their checksums.\n"
+    )
+    return body + "\n\n" + install
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -229,6 +232,8 @@ def main():
     verify.add_argument("--archive", type=Path, required=True)
     sums = commands.add_parser("checksums", help="validate all release targets and write SHA256SUMS")
     sums.add_argument("--dist", type=Path, default=Path("dist"))
+    note = commands.add_parser("notes", help="print release notes from the changelog")
+    note.add_argument("--changelog", type=Path, default=ROOT / "CHANGELOG.md")
     args = parser.parse_args()
     try:
         info = identity()
@@ -238,9 +243,11 @@ def main():
             package(info, args.target, args.dist.resolve())
         elif args.command == "verify":
             verify_archive(args.archive.resolve(), info, args.target)
+        elif args.command == "notes":
+            print(notes(info, args.changelog), end="")
         else:
             checksums(info, args.dist.resolve())
-    except (ValueError, OSError, subprocess.SubprocessError, tarfile.TarError, zipfile.BadZipFile) as error:
+    except (ValueError, OSError, subprocess.SubprocessError, tarfile.TarError) as error:
         parser.exit(1, f"release: {error}\n")
 
 

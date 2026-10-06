@@ -73,6 +73,7 @@ fn status_and_dry_run_report_json_and_write_nothing() {
             String::from_utf8_lossy(&output.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
         for key in [
             "taken_at",
             "pressure",

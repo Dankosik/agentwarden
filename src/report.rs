@@ -19,6 +19,8 @@ const RECENT_RECORDS: usize = 10;
 /// The documented `--format json` schema of `status`, `reclaim` and `watch`.
 #[derive(Debug, Serialize)]
 pub struct Report {
+    /// The agentwarden version that produced the report.
+    pub version: &'static str,
     pub taken_at: u64,
     /// Pressure the rules act on: the kernel's level, raised by swap trends.
     pub pressure: Pressure,
@@ -144,6 +146,7 @@ fn build(
         })
     });
     Report {
+        version: env!("CARGO_PKG_VERSION"),
         taken_at: snapshot.taken_at,
         pressure: state.effective_pressure(snapshot),
         kernel_pressure: snapshot.pressure,

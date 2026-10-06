@@ -235,8 +235,10 @@ pub mod macos {
             .map_err(io_error)?;
         let contents = crate::install::plist(&exe, home);
         if fs::read_to_string(&plist).is_ok_and(|current| current == contents) && loaded() {
+            // The binary may have been replaced in place by an upgrade.
+            run("/bin/launchctl", &["kickstart", "-k", &service])?;
             return Ok(format!(
-                "{label} already installed and running {}",
+                "{label} already installed; restarted {}",
                 exe.display()
             ));
         }

@@ -1,8 +1,7 @@
 # Security policy
 
-Security fixes target the current `main` branch and latest release. There is
-no promised backport or response-time commitment. Repositories generated from
-this template own their dependencies, releases, and security policy.
+Security fixes target the current `main` branch and the latest release. There
+is no promised backport or response-time commitment.
 
 ## Reporting a vulnerability
 
@@ -22,9 +21,7 @@ file or subprocess effects, secret disclosure, memory-safety defects, and releas
 or dependency supply-chain problems. A crash, resource spike, or confusing error
 may be a regular bug; describe the input and impact so it can be assessed.
 
-The template has no hosted service or production credentials to test. Do not
+agentwarden has no hosted service or production credentials to test. It
+signals processes of the current user only; a way to make it signal another
+user's process, a terminal process, or an agent itself is in scope. Do not
 scan third-party systems or include their private data in a reproduction.
-
-When adopting this template, update the reporting channel and supported-version
-policy for your project. Keep dependency and workflow updates reviewable, and
-publish artifacts only from the candidate covered by the release checks.

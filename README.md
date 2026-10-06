@@ -1,32 +1,68 @@
 # agentwarden
 
+[![CI](https://github.com/Dankosik/agentwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/Dankosik/agentwarden/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Dankosik/agentwarden?sort=semver)](https://github.com/Dankosik/agentwarden/releases/latest)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](#install)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Keeps a Mac that runs many AI coding agents (Claude Code, Codex) from filling
-its memory with idle agent helpers. It needs no configuration: an agent
-installs it once, and it runs in the background from then on.
+its memory with idle agent helpers. Install it once; it needs no configuration
+and runs in the background from then on.
 
-Status: macOS only. [Specification](specs/agentwarden/README.md) ·
-[research](specs/agentwarden/research.md) · [plan](specs/agentwarden/plan.md) ·
-[architecture](docs/architecture.md)
+Every Claude Code session starts its own MCP servers, and the Codex app keeps a
+pool per thread. They stay after the work is done, and helpers whose session
+exited stay forever. On a 16 GB Mac with a dozen sessions that is gigabytes of
+swap. On the author's machine, the first manual pass stopped 6 orphaned helper
+trees holding 1.55 GB.
 
-## For agents: install and verify
-
-Run these from a checkout of this repository on the user's Mac. Rust comes
-from [rustup](https://rust-lang.org/tools/install/); the checked-in toolchain
-selects the version.
+## Install
 
 ```sh
-cargo install --path . --locked
-agentwarden install
-agentwarden status --format json
+curl -fsSL https://raw.githubusercontent.com/Dankosik/agentwarden/main/install.sh | sh
 ```
 
-`install` writes `~/Library/LaunchAgents/io.github.dankosik.agentwarden.plist`
-and starts it; it is idempotent and repeats safely after a rebuild. The agent
-runs `agentwarden watch`, which applies the rules every 60 seconds at
-background priority. Nothing asks the user anything, and there is no
-configuration file.
+The script downloads the latest release for your Mac (Apple Silicon or Intel),
+checks it against `SHA256SUMS`, puts `agentwarden` in `~/.local/bin`, and
+starts the background agent. Run the same command again to upgrade; it
+restarts the agent on the new version. `AGENTWARDEN_VERSION=v0.1.0` pins a
+release and `AGENTWARDEN_BIN_DIR` changes the directory.
 
-To remove it: `agentwarden install --uninstall`.
+Then check it:
+
+```console
+$ agentwarden status
+memory: normal pressure (kernel normal), swap 5.74 GB of 7.00 GB, user idle 0 min
+claude code: 17 sessions, helpers 1.02 GB, idle over 60 min: 9
+codex: app 18701, helpers 0.01 GB in 1 processes, idle 55 min
+orphans: 0, 0.00 GB
+planned: nothing to do
+recent:
+  9 min ago  Stopped  idle-claude-session  node  0.18 GB
+  7 min ago  Stopped  orphan  node  0.32 GB
+```
+
+To remove it:
+
+```sh
+agentwarden install --uninstall && rm ~/.local/bin/agentwarden
+```
+
+Other ways to install: download an archive from
+[Releases](https://github.com/Dankosik/agentwarden/releases) and run
+`./agentwarden install` from where you keep it, or build from source with
+`cargo install --git https://github.com/Dankosik/agentwarden --locked` and then
+`agentwarden install`.
+
+### For agents
+
+An agent asked to set this up runs the install command above, then
+`agentwarden status --format json` and reports `version`, `pressure` and
+`planned`. Nothing asks the user anything, and there is no configuration file.
+`agentwarden install` writes
+`~/Library/LaunchAgents/io.github.dankosik.agentwarden.plist` for the binary it
+is run from and starts it; repeating it restarts the agent. The agent runs
+`agentwarden watch`, which applies the rules every 60 seconds at background
+priority.
 
 ## What it does
 
@@ -70,6 +106,7 @@ Safety rules:
 
 | Field | Meaning |
 | --- | --- |
+| `version` | agentwarden version |
 | `taken_at` | Unix time of the sample |
 | `pressure`, `kernel_pressure` | `normal`, `warning`, `critical`; `pressure` is the kernel level raised by swap trends, which the rules use |
 | `swap` | `used_bytes`, `total_bytes` |
@@ -88,6 +125,14 @@ Files: state and the action log (`actions.jsonl`) live in
 `~/Library/Application Support/agentwarden/`; the LaunchAgent's errors go to
 `~/Library/Logs/agentwarden.log`.
 
+## Versions
+
+Releases follow [Semantic Versioning](https://semver.org/). The commands and
+flags, the JSON fields, exit codes, file locations and the LaunchAgent label
+are the public interface; before 1.0, a minor release may change them and says
+so in the [changelog](CHANGELOG.md). `agentwarden --version` and the `version`
+JSON field show what is installed.
+
 ## Development
 
 ```sh
@@ -98,7 +143,10 @@ cargo run --locked -- reclaim --dry-run
 
 Rules are pure functions of recorded snapshots and are tested without touching
 the machine; tests never install the LaunchAgent. See
-[contributing](CONTRIBUTING.md) and [agent workflow](docs/agent-workflow.md).
+[contributing](CONTRIBUTING.md), [architecture](docs/architecture.md),
+[releasing](docs/releasing.md), and the
+[specification](specs/agentwarden/README.md) with its
+[research](specs/agentwarden/research.md).
 
 Built from [rust-cli-template](https://github.com/Dankosik/rust-cli-template).
 Licensed under [MIT](LICENSE).
