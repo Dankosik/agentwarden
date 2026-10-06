@@ -23,9 +23,12 @@ curl -fsSL https://raw.githubusercontent.com/Dankosik/agentwarden/main/install.s
 
 The script downloads the latest release for your Mac (Apple Silicon or Intel),
 checks it against `SHA256SUMS`, puts `agentwarden` in `~/.local/bin`, and
-starts the background agent. Run the same command again to upgrade; it
-restarts the agent on the new version. `AGENTWARDEN_VERSION=v0.1.0` pins a
-release and `AGENTWARDEN_BIN_DIR` changes the directory.
+starts the background agent. If `~/.local/bin` is not on your `PATH`, it adds
+one line to your shell's startup file (`~/.zshrc` for zsh) and asks you to open
+a new terminal. Run the same command again to upgrade; it restarts the agent on
+the new version. `AGENTWARDEN_VERSION=v0.1.0` pins a release,
+`AGENTWARDEN_BIN_DIR` changes the directory, and `AGENTWARDEN_NO_MODIFY_PATH=1`
+leaves startup files alone.
 
 Then check it:
 
@@ -46,6 +49,9 @@ To remove it:
 ```sh
 agentwarden install --uninstall && rm ~/.local/bin/agentwarden
 ```
+
+and delete the line marked `# Added by the agentwarden installer` from your
+shell's startup file if the installer added one.
 
 Other ways to install: download an archive from
 [Releases](https://github.com/Dankosik/agentwarden/releases) and run
