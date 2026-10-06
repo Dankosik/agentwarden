@@ -177,3 +177,17 @@ moment both found 13 Claude Code sessions with 27 non-shell children.
 `serve --mcp` trees, each a server plus a parent-watching child, orphaned for
 more than a day. `reclaim` stopped all 12 processes with SIGTERM, none needed
 SIGKILL, and logged 1.55 GB of footprint; swap use fell by 224 MB at once.
+
+**T15: graceful quit and relaunch of the app hosting Codex.** With the owner's
+approval, the ChatGPT app (PID 79911) received SIGTERM. It exited in under a
+second, without a dialog or permission prompt. `open -g -j -a
+/Applications/ChatGPT.app` started it again without taking focus (the app
+still shows its window); within 15 s its Codex app-server and helpers were
+running, and all 8,020 Codex session files were unchanged. AppleScript `quit`,
+which would need Automation consent, is not needed.
+
+Two processes of the old app survived with PPID 1: a `codex exec` run, which
+the rules never stop because it is a Codex runtime, and the app's native
+`bare-modifier-monitor`, which the new app started a second copy of. The
+helper history now includes the app's own non-shell, non-runtime descendants,
+so such leftovers are reclaimed by the orphan rule after a restart.

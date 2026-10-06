@@ -105,5 +105,5 @@ As of 2026-10-06, branch `feat/agentwarden`:
 | T13 | Done by R1 | Same Claude Code version (2.1.286) as the R1 experiment |
 | T9 | Waiting for the owner | Installing a LaunchAgent changes the owner's login items |
 | T14 | Running | One-hour observation of an idle Codex |
-| T15 | Waiting for the owner | Needs one deliberate quit of the ChatGPT app |
+| T15 | Done | SIGTERM quit in under 1 s, no prompt; background relaunch; Codex threads intact ([research](research.md)) |
 | T17 | After T9 and T15 | Happens when the conditions first hold |

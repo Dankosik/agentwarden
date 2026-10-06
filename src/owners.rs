@@ -49,7 +49,7 @@ pub struct Session {
 #[derive(Debug)]
 pub struct CodexApp {
     pub pid: i32,
-    /// Helper servers of those runtimes.
+    /// Helper servers of the Codex runtimes inside the app.
     pub pools: Vec<i32>,
     /// Age of the youngest shell or `codex exec` started inside the app, if any.
     pub youngest_activity_secs: Option<u64>,
@@ -228,10 +228,28 @@ impl<'a> Ownership<'a> {
             .flat_map(|session| session.helpers.iter())
             .chain(&self.codex_runtime_helpers)
             .chain(self.codex_app.iter().flat_map(|app| app.pools.iter()));
-        roots
+        let mut identities: BTreeSet<Identity> = roots
             .flat_map(|root| self.tree(*root))
             .map(Process::identity)
-            .collect()
+            .collect();
+        // The app's own native helpers outlive a quit; remembering them lets the
+        // orphan rule reclaim them after a restart. Commands run by shells and
+        // the Codex runtimes themselves are not helpers.
+        if let Some(app) = &self.codex_app {
+            let mut stack = vec![app.pid];
+            while let Some(pid) = stack.pop() {
+                for child in self.children.get(&pid).into_iter().flatten() {
+                    if let Some(process) = self.process(*child)
+                        && !is_shell(process)
+                        && !is_agent_host(process)
+                    {
+                        identities.insert(process.identity());
+                        stack.push(*child);
+                    }
+                }
+            }
+        }
+        identities
     }
 }
 
@@ -325,6 +343,14 @@ pub(crate) mod tests {
                 8,
             ),
             proc(213, 210, "/bin/zsh", "/bin/zsh -lc rg foo", 40, 3),
+            proc(
+                215,
+                200,
+                "/Applications/ChatGPT.app/Contents/Resources/native/bare-modifier-monitor",
+                "bare-modifier-monitor",
+                2000,
+                5,
+            ),
             // A user service run by launchd, and an interactive shell.
             proc(
                 300,
@@ -426,6 +452,26 @@ pub(crate) mod tests {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        assert_eq!(pids, [111, 112, 121, 122, 211, 212]);
+        assert_eq!(pids, [111, 112, 121, 122, 211, 212, 215]);
+    }
+
+    #[test]
+    fn app_helpers_left_by_a_restart_become_orphans() {
+        let before = machine();
+        let known = Ownership::new(&before, &BTreeSet::new()).helper_identities();
+        let mut after = machine();
+        // The app quit: its native helper is reparented to launchd.
+        after
+            .processes
+            .retain(|p| ![200, 210, 211, 212, 213].contains(&p.pid));
+        after
+            .processes
+            .iter_mut()
+            .find(|p| p.pid == 215)
+            .unwrap()
+            .ppid = 1;
+        let ownership = Ownership::new(&after, &known);
+        assert!(ownership.orphans.contains(&215));
+        assert!(ownership.codex_app.is_none());
     }
 }
