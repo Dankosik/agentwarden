@@ -154,3 +154,26 @@ multiplexer.
 **Decision.** `status` reports duplicate groups by command and cwd, and names
 the multiplexer as the remedy for configurable servers. For Claude sessions,
 idle reclamation (R1) is an alternative that needs no extra component.
+
+## Implementation checks (2026-10-06)
+
+**T11: idle CPU of a Claude Code session.** Thirteen sessions sampled once a
+minute. Twelve waiting sessions spent 0.19–0.67 s of CPU per minute, most of
+them 0.22–0.45 s; the session doing this work spent 0.55–1.26 s, and one other
+session 1.35–2.12 s. The idle tolerance is 0.5 s per minute: a spike above it
+only restarts the idle clock, the conservative direction. A shell started by the
+session inside the idle window also counts as activity.
+
+**Footprint source.** `top -l 1 -stats pid,mem` printed the same value as
+`proc_pid_rusage`'s `phys_footprint` for six processes between 243 and 613 MB,
+reads all 503 processes without root, and takes about 0.5 s. It replaced the
+`libproc` crate, whose `bindgen` build dependency is BSD-3-Clause with an ISC
+dependency, outside the allowed licenses, and needs libclang.
+
+**T3/T4: attribution.** `agentwarden status` and a manual analysis of the same
+moment both found 13 Claude Code sessions with 27 non-shell children.
+
+**T7: live orphan reclamation.** The dry run planned six orphaned codegraph
+`serve --mcp` trees, each a server plus a parent-watching child, orphaned for
+more than a day. `reclaim` stopped all 12 processes with SIGTERM, none needed
+SIGKILL, and logged 1.55 GB of footprint; swap use fell by 224 MB at once.

@@ -1,7 +1,8 @@
 # Agent instructions
 
-This is a Rust CLI template with a synchronous streaming example. Extend or
-replace the example for the requested task; preserve unrelated work.
+agentwarden is a synchronous macOS CLI that keeps idle AI agent helpers from
+filling memory. [The specification](specs/agentwarden/README.md) owns its
+behavior and safety contract; preserve unrelated work.
 
 ## Scope and authority
 
@@ -50,7 +51,7 @@ improvement claims still require comparable measurements.
 Select `.agents/skills/` by the decision needing guidance, not because a file is
 Rust. Read only selected bodies; skills are composable references, not a mandatory
 chain. [Agent workflow](docs/agent-workflow.md) supplies fallback navigation,
-delegation, and pinned-update guidance. Use [first command](docs/first-command.md)
+delegation, and pinned-update guidance. Use [architecture](docs/architecture.md)
 when adding/replacing a command, [releasing](docs/releasing.md) for packaging or
 an authorized release, and [agent review](docs/agent-review.md) for a requested
 review or a risk-driven review of a substantial change. Instruction changes use
