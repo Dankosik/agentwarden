@@ -7,6 +7,12 @@ section of the tagged version as its release notes.
 
 ## [Unreleased]
 
+### Added
+
+- `install.sh` adds the install directory to `PATH` in the shell's startup
+  file when it is missing, as rustup and uv do;
+  `AGENTWARDEN_NO_MODIFY_PATH=1` skips that.
+
 ## [0.1.0] - 2026-10-06
 
 First release, for macOS on Apple Silicon and Intel.
