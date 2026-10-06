@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install or upgrade agentwarden from GitHub Releases and start its LaunchAgent.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Dankosik/agentwarden/main/install.sh | sh
+#   curl -fsSL https://github.com/Dankosik/agentwarden/releases/latest/download/install.sh | sh
 #
 # AGENTWARDEN_VERSION selects a release such as v0.1.0 (default: the latest).
 # AGENTWARDEN_BIN_DIR selects where the binary goes (default: ~/.local/bin).

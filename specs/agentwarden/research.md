@@ -240,4 +240,7 @@ every Claude helper would miss plugin and forwarded servers. Left for a later
 release: helper CPU as a sign of an in-flight MCP
 call, relaunching an app that quit after the 60-second wait, release
 attestations and immutable releases, and serving `install.sh` from the
-release.
+release. 0.1.2 closes the last three. The first two stay open until the
+action log shows a stop during work: an in-flight MCP call needs at least an
+hour of a session waiting on one server under warning pressure, and the
+Claude exec case does not occur with Claude Code's Bash tool.

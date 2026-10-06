@@ -28,7 +28,18 @@ pub struct State {
     pub sessions: BTreeMap<String, SessionActivity>,
     pub last_swap_used_bytes: Option<u64>,
     pub last_codex_restart_at: Option<u64>,
+    /// An app a restart asked to quit and that has not been opened again.
+    pub pending_relaunch: Option<PendingRelaunch>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRelaunch {
+    pub bundle: std::path::PathBuf,
+    pub since: u64,
+}
+
+/// After this, a still closed app is the user's choice, not agentwarden's.
+pub const RELAUNCH_WINDOW_SECS: u64 = 10 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionActivity {

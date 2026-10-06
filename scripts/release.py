@@ -88,6 +88,12 @@ def check_tag(info, tag, repository):
         raise ValueError("release tag does not identify the checked-out commit")
     if run_text(["git", "status", "--porcelain", "--untracked-files=no"]):
         raise ValueError("tracked source files changed after checkout")
+    # Releases come from reviewed history only.
+    if subprocess.run(
+        ["git", "merge-base", "--is-ancestor", head, "refs/remotes/origin/main"],
+        cwd=ROOT, capture_output=True,
+    ).returncode != 0:
+        raise ValueError("release tag is not on origin/main")
     print(f"Verified {repository} {tag} at {head}")
 
 
@@ -206,14 +212,16 @@ def notes(info, changelog):
     if not body:
         raise ValueError(f"{changelog.name} section for {info.version} is empty")
     owner_repo = info.repository.removeprefix("https://github.com/").rstrip("/")
+    download = f"https://github.com/{owner_repo}/releases/download/v{info.version}"
     install = (
         "## Install or upgrade\n\n"
         "```sh\n"
-        f"curl -fsSL https://raw.githubusercontent.com/{owner_repo}/v{info.version}/install.sh"
-        f" | AGENTWARDEN_VERSION=v{info.version} sh\n"
+        f"curl -fsSL {download}/install.sh | AGENTWARDEN_VERSION=v{info.version} sh\n"
         "```\n\n"
         "Archives are for macOS on Apple Silicon (`aarch64-apple-darwin`) and Intel "
-        "(`x86_64-apple-darwin`); `SHA256SUMS` lists their checksums.\n"
+        "(`x86_64-apple-darwin`); `SHA256SUMS` lists their checksums. Each archive "
+        "has a build provenance attestation: "
+        f"`gh attestation verify <archive> --repo {owner_repo}`.\n"
     )
     return body + "\n\n" + install
 

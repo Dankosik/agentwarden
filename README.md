@@ -18,7 +18,7 @@ trees holding 1.55 GB.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Dankosik/agentwarden/main/install.sh | sh
+curl -fsSL https://github.com/Dankosik/agentwarden/releases/latest/download/install.sh | sh
 ```
 
 The script downloads the latest release for your Mac (Apple Silicon or Intel),
@@ -52,6 +52,12 @@ agentwarden install --uninstall && rm ~/.local/bin/agentwarden
 
 and delete the line marked `# Added by the agentwarden installer` from your
 shell's startup file if the installer added one.
+
+The script comes from the latest release, together with the binary it
+installs. Releases are immutable, and each archive carries a build provenance
+attestation from GitHub Actions: with the GitHub CLI,
+`gh attestation verify <archive> --repo Dankosik/agentwarden` proves it was
+built by this repository's release workflow.
 
 Other ways to install: download an archive from
 [Releases](https://github.com/Dankosik/agentwarden/releases) and run

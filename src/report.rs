@@ -10,7 +10,7 @@ use crate::{
     model::{Pressure, Snapshot, Swap},
     owners::Ownership,
     rules::{self, Action},
-    state::State,
+    state::{PendingRelaunch, RELAUNCH_WINDOW_SECS, State},
     store::{Outcome, Record, Store},
 };
 
@@ -89,13 +89,35 @@ pub fn pass(system: &dyn System, store: &Store, apply: bool) -> Result<Report, A
             ..report_without_actions
         });
     }
-    let applied = actions::execute(system, &report_without_actions.planned, snapshot.user);
-    if applied
+    let mut applied = Vec::new();
+    // An app a restart left quit is opened again once it is gone, until the
+    // window passes; a running app needs nothing.
+    if let Some(pending) = state.pending_relaunch.take()
+        && ownership.codex_app.is_none()
+        && snapshot.taken_at.saturating_sub(pending.since) <= RELAUNCH_WINDOW_SECS
+    {
+        let record = actions::relaunch(system, &pending.bundle);
+        if record.outcome != Outcome::Restarted {
+            state.pending_relaunch = Some(pending);
+        }
+        applied.push(record);
+    }
+    let executed = actions::execute(system, &report_without_actions.planned, snapshot.user);
+    for (action, record) in report_without_actions.planned.iter().zip(&executed) {
+        if let Some(bundle) = actions::left_quit(action, record) {
+            state.pending_relaunch = Some(PendingRelaunch {
+                bundle,
+                since: snapshot.taken_at,
+            });
+        }
+    }
+    if executed
         .iter()
         .any(|record| record.rule == "idle-codex-restart" && record.outcome != Outcome::Skipped)
     {
         state.last_codex_restart_at = Some(snapshot.taken_at);
     }
+    applied.extend(executed);
     state.observe(&snapshot, &ownership);
     // Both are attempted: state holds the restart gate, the log the record of
     // what was done. A failed log write does not fail the pass.
@@ -379,5 +401,44 @@ mod tests {
         assert!(rendered.contains("claude code: 2 sessions"), "{rendered}");
         assert!(rendered.contains("planned: nothing to do"), "{rendered}");
         assert!(rendered.contains("Stopped  orphan  node"), "{rendered}");
+    }
+
+    #[test]
+    fn an_app_that_quits_after_the_wait_is_opened_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        let mut machine = Machine::new();
+        {
+            let mut snapshot = machine.snapshot.borrow_mut();
+            snapshot.processes.retain(|p| p.pid != 213);
+            snapshot.codex_activity_at = Some(snapshot.taken_at - 40 * 60);
+            snapshot.user_idle_secs = Some(45 * 60);
+            snapshot.pressure = crate::model::Pressure::Warning;
+        }
+        // The app ignores the quit for longer than the wait.
+        machine.system.immortal.insert(200);
+        let first = pass(&machine, &store, true).unwrap();
+        let restart = first
+            .applied
+            .iter()
+            .find(|record| record.rule == "idle-codex-restart")
+            .unwrap();
+        assert_eq!(restart.outcome, Outcome::Refused);
+        assert!(machine.system.launched.borrow().is_empty());
+
+        // It quits a moment later; the next pass opens it again, once.
+        for pid in [200, 210, 211, 212, 215] {
+            machine.system.alive.borrow_mut().remove(&pid);
+        }
+        machine.snapshot.borrow_mut().taken_at += 60;
+        let second = pass(&machine, &store, true).unwrap();
+        assert_eq!(second.applied[0].outcome, Outcome::Restarted);
+        assert_eq!(
+            *machine.system.launched.borrow(),
+            [std::path::PathBuf::from("/Applications/ChatGPT.app")]
+        );
+        machine.snapshot.borrow_mut().taken_at += 60;
+        pass(&machine, &store, true).unwrap();
+        assert_eq!(machine.system.launched.borrow().len(), 1);
     }
 }

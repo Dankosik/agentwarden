@@ -7,6 +7,22 @@ section of the tagged version as its release notes.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-06
+
+### Fixed
+
+- When ChatGPT quits later than the 60-second wait of an idle Codex restart,
+  or opening it again fails, later passes open it again once it is gone, for
+  up to 10 minutes. 0.1.1 left it closed.
+
+### Added
+
+- Releases carry `install.sh`, and the README installs with the script of
+  the latest release, so the script and the binary come from one version.
+- Each archive has a GitHub build provenance attestation:
+  `gh attestation verify <archive> --repo Dankosik/agentwarden`. Releases are
+  immutable, published from a draft, and only from a tag on `main`.
+
 ## [0.1.1] - 2026-10-06
 
 Safety fixes from an independent review. Upgrading is recommended: 0.1.0 could
@@ -79,6 +95,7 @@ First release, for macOS on Apple Silicon and Intel.
 - `install.sh`: install or upgrade from GitHub Releases with checksum
   verification.
 
-[Unreleased]: https://github.com/Dankosik/agentwarden/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Dankosik/agentwarden/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Dankosik/agentwarden/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Dankosik/agentwarden/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Dankosik/agentwarden/releases/tag/v0.1.0

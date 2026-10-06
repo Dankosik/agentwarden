@@ -4,9 +4,13 @@ agentwarden ships native archives for macOS on Apple Silicon and Intel. A `v`
 tag starts the release workflow. It runs the same required CI as a pull
 request, validates the tag and repository against Cargo metadata, builds on
 each native runner, and tests the executable after extracting it from its final
-archive. A single final job publishes both archives, `SHA256SUMS`, and the
-tagged version's [changelog](../CHANGELOG.md) section as a GitHub Release.
-[`install.sh`](../install.sh) installs from that release.
+archive, and attests each archive's build provenance. A single final job
+creates a draft GitHub Release with both archives, `SHA256SUMS`,
+[`install.sh`](../install.sh) and the tagged version's
+[changelog](../CHANGELOG.md) section, then publishes it. The repository has
+immutable releases on: once published, a release's assets and tag cannot
+change. The README installs with the `install.sh` of the latest release, so
+the script and the binary always come from the same version.
 
 To verify packaging before a release, open the **Release** workflow in GitHub
 Actions and choose **Run workflow** on a branch. This runs CI, builds and tests
@@ -43,8 +47,8 @@ least a minor version.
 5. After the release is published, run `install.sh` on a Mac and confirm
    `agentwarden status --format json` reports the new `version`.
 
-The tag must identify the exact checked-out commit and its version must equal
-Cargo's version. The publication step refuses to overwrite an existing release.
+The tag must identify the exact checked-out commit, that commit must be on
+`origin/main`, and its version must equal Cargo's version. The publication step refuses to overwrite an existing release.
 If a run fails before publication, repair the cause and rerun it. If a release
 already exists or publication partly succeeded, inspect its assets and the run
 before deciding whether to finish that release or issue a new version. Do not
@@ -82,8 +86,10 @@ so Gatekeeper does not block them; an archive downloaded with a browser needs
 
 Verify a manually downloaded archive with
 `shasum -a 256 --check --ignore-missing SHA256SUMS`; `install.sh` does this
-itself. Checksums detect download corruption; they are not an independent
-publisher signature.
+itself. Checksums detect download corruption. Authenticity comes from the
+build provenance attestation: `gh attestation verify <archive> --repo
+Dankosik/agentwarden` checks that this repository's release workflow built
+it. Releases before 0.1.2 have no attestation.
 
 When changing a target, update the release workflow matrix, `TARGETS` in
 `scripts/release.py`, `install.sh`, this table, and the corresponding

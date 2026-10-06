@@ -142,7 +142,9 @@ code:
 Restart sequence: ask the app to quit gracefully; if it has not exited within
 60 seconds, abort and record the refusal (never force-kill the app); relaunch
 it in the background without focus; the next pass reclaims helpers the quit
-left orphaned.
+left orphaned. If the app quits after the 60 seconds, or the relaunch fails,
+later passes open it again once it is gone, for up to 10 minutes; after that a
+closed app is taken as the user's choice.
 
 MCP pool members are children of a Codex runtime whose command line matches an
 MCP server in a configuration or whose executable is inside the app bundle.

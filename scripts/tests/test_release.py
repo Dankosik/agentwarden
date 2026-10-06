@@ -136,7 +136,8 @@ class NotesTests(unittest.TestCase):
         self.assertTrue(notes.startswith("### Added\n\n- second\n\n## Install"))
         self.assertNotIn("first", notes)
         self.assertNotIn("next", notes)
-        self.assertIn("example/tool/v0.2.0/install.sh", notes)
+        self.assertIn("example/tool/releases/download/v0.2.0/install.sh", notes)
+        self.assertIn("gh attestation verify", notes)
         self.assertIn("AGENTWARDEN_VERSION=v0.2.0", notes)
 
     def test_missing_or_empty_section_is_refused(self):
@@ -159,6 +160,7 @@ class TagTests(unittest.TestCase):
         self.git("add", "source")
         self.commit()
         self.git("tag", "v0.1.0")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         self.root_patch = patch.object(release, "ROOT", self.root)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
@@ -181,6 +183,14 @@ class TagTests(unittest.TestCase):
     def test_rejects_source_modified_after_checkout(self):
         (self.root / "source").write_text("modified\n")
         with self.assertRaisesRegex(ValueError, "source files changed"):
+            release.check_tag(self.info, "v0.1.0", "example/tool")
+
+    def test_rejects_a_tag_outside_main(self):
+        (self.root / "source").write_text("branch\n")
+        self.git("add", "source")
+        self.commit()
+        self.git("tag", "-f", "v0.1.0")
+        with self.assertRaisesRegex(ValueError, "not on origin/main"):
             release.check_tag(self.info, "v0.1.0", "example/tool")
 
     def test_rejects_tag_pointing_to_a_different_commit(self):
