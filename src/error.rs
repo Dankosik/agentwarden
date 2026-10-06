@@ -17,6 +17,15 @@ pub(crate) enum AppError {
     #[cfg(target_os = "macos")]
     #[error("{program} failed: {status}")]
     CommandFailed { program: String, status: String },
+    #[cfg(target_os = "macos")]
+    #[error("{program} did not finish within {seconds} s")]
+    CommandTimedOut { program: String, seconds: u64 },
+    #[cfg(target_os = "macos")]
+    #[error("{program} printed output agentwarden cannot read")]
+    Unreadable { program: String },
+    #[cfg(target_os = "macos")]
+    #[error("agentwarden runs as the user whose agents it watches, not as root")]
+    Root,
     #[error("cannot write agentwarden state or log: {0}")]
     Store(#[source] io::Error),
     #[cfg(target_os = "macos")]

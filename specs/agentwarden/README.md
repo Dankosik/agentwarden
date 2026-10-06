@@ -113,8 +113,8 @@ process passes the [safety contract](#safety-contract).
 
 | Rule | Target | When | Why it is safe |
 | --- | --- | --- | --- |
-| Orphan | A helper process whose agent parent has exited (PPID 1, or a recycled parent PID) and whose command line belongs to an agent tool's helper | Older than a short grace period | No session can use it again |
-| Idle Claude session | Every MCP server child of a Claude Code session whose own CPU time has not grown for the idle window | Idle window chosen by pressure (below) | Claude Code restarts a stopped server on the next tool call (R1, observed twice) |
+| Orphan | A helper process whose agent parent has exited (PPID 1): one seen serving a live agent, or one whose command line matches a configured MCP server with a specific program and arguments (a generic launcher such as `node` or `npx` alone is not evidence) | Older than a short grace period, and only while launchd's job list is readable | No session can use it again |
+| Idle Claude session | Every MCP server child of a Claude Code session whose own CPU time has not grown for the idle window, that started no process in it, and that runs no shell | Idle window chosen by pressure (below) | Claude Code restarts a stopped server on the next tool call (R1, observed twice) |
 | Codex leak | Codex app-server MCP children | Never stopped one by one | Codex reports a stopped server as "not connected" in that thread (R1) |
 | Idle Codex restart | The ChatGPT app that hosts Codex, restarted as a whole | All [conditions](#idle-codex-restart) hold | Saved threads persist on disk; restarting frees every pool the app leaked (swap 23.3 → 5.1 GB observed) |
 
@@ -122,7 +122,9 @@ process passes the [safety contract](#safety-contract).
 on their own work, such as watching files, while no one calls them. A session
 that has run no turn is idle whatever its servers do. A REPL-style server
 (state kept in its process) loses that state when an idle session's servers are
-stopped; the session gets a fresh one on its next call.
+stopped; the session gets a fresh one on its next call. Idle time is counted
+only across passes about a minute apart: after a gap, such as the Mac
+sleeping, every session's clock starts again.
 
 ### Idle Codex restart
 
@@ -132,9 +134,9 @@ code:
 
 | Condition | Default | Signal (no root needed, checked on the owner's machine) |
 | --- | --- | --- |
-| No Codex turn activity | 30 minutes | No `~/.codex/sessions/**/rollout-*.jsonl` modified, and no process started under the Codex app-server except MCP pool members |
+| No Codex turn activity | 30 minutes | No `~/.codex/sessions/**/rollout-*.jsonl` modified, and nothing running under the app except MCP pool members: no shell, no `codex exec`, no command, however long it has run |
 | Nobody at the machine | 30 minutes | HID idle time from `IOHIDSystem` |
-| Worth restarting | Codex helpers' footprint ≥ 1 GB, or pressure Warning or Critical | Footprint (R4), pressure level |
+| Worth restarting | The Codex runtimes with everything under them hold ≥ 1 GB, or ≥ 512 MB under Warning or Critical pressure | Footprint (R4), pressure level |
 | Not too often | At most once per 6 hours | Action log |
 
 Restart sequence: ask the app to quit gracefully; if it has not exited within
@@ -142,9 +144,10 @@ Restart sequence: ask the app to quit gracefully; if it has not exited within
 it in the background without focus; the next pass reclaims helpers the quit
 left orphaned.
 
-MCP pool members are processes whose command line matches an MCP server in
-Codex's own configuration (`~/.codex/config.toml`) or one of Codex's bundled
-helpers. Pools that Codex starts by itself while idle
+MCP pool members are children of a Codex runtime whose command line matches an
+MCP server in a configuration or whose executable is inside the app bundle.
+Any other child is a command: a shell that runs one command execs it, so a
+running `cargo test` is the runtime's own child. Pools that Codex starts by itself while idle
 ([openai/codex#43971](https://github.com/openai/codex/issues/43971)) therefore
 do not count as activity.
 
@@ -154,7 +157,10 @@ do not count as activity.
 | --- | --- | --- |
 | Normal | Kernel memory pressure normal and swap not growing | Idle-session rule does not run |
 | Warning | Kernel pressure warn, or swap grew during the last interval | 60 minutes |
-| Critical | Kernel pressure critical, or swap above 90 % of its current size | 15 minutes |
+| Critical | Kernel pressure critical | 15 minutes |
+
+How full swap is does not raise the level: macOS adds swap files as it needs
+them, so allocated swap is nearly always nearly full.
 
 The orphan rule runs at every level. The windows are defaults in code, not
 configuration; changing them is a product change.
@@ -189,14 +195,16 @@ actions are outcomes in the log, not failures.
 
 ### Safety contract
 
-- Before a signal, the PID is revalidated by start time and command line; a
-  changed process is skipped.
-- Only the current user's processes are signalled. System processes,
-  terminals, editors, and any process with a TTY are never signalled. The
+- Before a signal, the PID is revalidated by start time and owner; a changed
+  process is skipped.
+- Only the current user's processes are signalled, and agentwarden refuses to
+  run as root. System processes, shells, terminals, editors, and any process
+  with a TTY are never signalled; a helper with one of them, or an agent,
+  among its descendants is left alone with its whole tree. The
   agent applications are never signalled either; the only exception is the
   graceful quit in [idle Codex restart](#idle-codex-restart).
-- Stopping is SIGTERM, then SIGKILL after a grace period, applied to the
-  server's process group when it owns one.
+- Stopping is SIGTERM, then SIGKILL after a grace period, to each process of
+  the tree, children first. Zombies are skipped: they have exited already.
 - Every stop appends one structured record to the action log.
 
 ## Accepted decisions

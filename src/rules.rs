@@ -20,6 +20,8 @@ pub fn claude_idle_window_secs(pressure: Pressure) -> Option<u64> {
 
 pub const CODEX_IDLE_SECS: u64 = 30 * 60;
 pub const USER_IDLE_SECS: u64 = 30 * 60;
+/// What the Codex runtimes must hold for a restart to be worth it; under
+/// memory pressure half of it is enough.
 pub const CODEX_WORTH_RESTART_BYTES: u64 = 1 << 30;
 pub const CODEX_RESTART_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
@@ -93,12 +95,14 @@ pub fn plan(snapshot: &Snapshot, ownership: &Ownership<'_>, state: &State) -> Ve
             let Some(idle) = state.session_idle_secs(&process.identity(), now) else {
                 continue;
             };
-            // A command the session started within the window means it is working.
+            // A running shell, however old, or anything started within the
+            // window means the session is working. A shell that runs a single
+            // command execs it, so a long command can be a direct child.
             let busy_shell = ownership
                 .descendants(session.pid)
                 .into_iter()
                 .filter_map(|pid| ownership.process(pid))
-                .any(|child| is_shell(child) && child.age_secs < window);
+                .any(|child| is_shell(child) || child.age_secs < window);
             if idle < window || busy_shell {
                 continue;
             }
@@ -133,21 +137,32 @@ fn codex_restart(
     let now = snapshot.taken_at;
     let app = ownership.codex_app.as_ref()?;
     let process = ownership.process(app.pid)?;
+    // A running command is work in progress however quiet it is.
+    if !app.commands.is_empty() {
+        return None;
+    }
     let codex_idle = snapshot
         .codex_activity_at
-        .map_or(process.age_secs, |at| now.saturating_sub(at))
-        .min(app.youngest_activity_secs.unwrap_or(u64::MAX));
+        .map_or(process.age_secs, |at| now.saturating_sub(at));
     let user_idle = snapshot.user_idle_secs?;
     let footprint: u64 = app
-        .pools
+        .runtimes
         .iter()
-        .map(|pool| ownership.tree_footprint(*pool))
+        .map(|runtime| ownership.tree_footprint(*runtime))
         .sum();
     let recent_restart = state
         .last_codex_restart_at
         .is_some_and(|at| now.saturating_sub(at) < CODEX_RESTART_INTERVAL_SECS);
-    let worth = footprint >= CODEX_WORTH_RESTART_BYTES || pressure >= Pressure::Warning;
-    if codex_idle < CODEX_IDLE_SECS || user_idle < USER_IDLE_SECS || !worth || recent_restart {
+    let needed = if pressure >= Pressure::Warning {
+        CODEX_WORTH_RESTART_BYTES / 2
+    } else {
+        CODEX_WORTH_RESTART_BYTES
+    };
+    if codex_idle < CODEX_IDLE_SECS
+        || user_idle < USER_IDLE_SECS
+        || footprint < needed
+        || recent_restart
+    {
         return None;
     }
     Some(Action::RestartCodex {
@@ -156,7 +171,7 @@ fn codex_restart(
         app_exe: process.exe.clone(),
         footprint_bytes: footprint,
         reason: format!(
-            "Codex idle {} min, user idle {} min, helpers {} MB, {:?} pressure",
+            "Codex idle {} min, user idle {} min, Codex holds {} MB, {:?} pressure",
             codex_idle / 60,
             user_idle / 60,
             footprint >> 20,
@@ -167,6 +182,14 @@ fn codex_restart(
 
 fn stop(ownership: &Ownership<'_>, root: i32, rule: Rule, reason: String) -> Option<Action> {
     let process = ownership.process(root)?;
+    // A helper that started an agent, a shell or a terminal program is doing
+    // someone's work; it is left alone with everything under it.
+    if std::iter::once(root)
+        .chain(ownership.descendants(root))
+        .any(|pid| ownership.is_protected(pid))
+    {
+        return None;
+    }
     Some(Action::Stop {
         rule,
         root: target(process),
@@ -207,14 +230,21 @@ mod tests {
             .collect()
     }
 
-    /// Observe the machine, then age every session by `idle_secs` without CPU.
+    /// Observe the machine every minute for `idle_secs` while no session spends
+    /// CPU, as the watch loop would.
     fn aged(snapshot: &mut Snapshot, idle_secs: u64) -> State {
         let mut state = State::default();
-        let ownership = Ownership::new(snapshot, &known_gopls());
-        state.observe(snapshot, &ownership);
+        let end = snapshot.taken_at + idle_secs;
+        loop {
+            let ownership = Ownership::new(snapshot, &state.known_helpers);
+            state.observe(snapshot, &ownership);
+            if snapshot.taken_at >= end {
+                break;
+            }
+            snapshot.taken_at = (snapshot.taken_at + 60).min(end);
+        }
         // gopls (402) was seen serving a session before it was orphaned.
         state.known_helpers.extend(known_gopls());
-        snapshot.taken_at += idle_secs;
         state
     }
 
@@ -257,7 +287,7 @@ mod tests {
                 .filter(|(rule, _)| *rule == Rule::IdleClaudeSession)
                 .map(|(_, pid)| pid)
                 .collect();
-            // Session 110 has a shell started 30 s ago, so only 120 is idle.
+            // Session 110 runs a command in a shell, so only 120 is idle.
             let expected: &[i32] = if expect_stops { &[121, 122] } else { &[] };
             assert_eq!(stopped, expected, "{pressure:?} after {idle} s");
         }
@@ -301,6 +331,18 @@ mod tests {
         ));
         assert!(!restarts(&shell, &state), "a command started 5 minutes ago");
 
+        // `zsh -lc 'cargo test'` execs cargo; it has run, silent, for 2 hours.
+        let (mut long, state) = codex_ready();
+        long.processes.push(crate::owners::tests::proc(
+            214,
+            210,
+            "/Users/u/.cargo/bin/cargo",
+            "cargo test",
+            7200,
+            200,
+        ));
+        assert!(!restarts(&long, &state), "a long silent command");
+
         let (mut present, state) = codex_ready();
         present.user_idle_secs = Some(5 * 60);
         assert!(!restarts(&present, &state), "user at the machine");
@@ -313,11 +355,72 @@ mod tests {
         cheap.pressure = Pressure::Normal;
         assert!(
             !restarts(&cheap, &state),
-            "pools under 1 GB, normal pressure"
+            "Codex under 1 GB, normal pressure"
         );
+
+        // Under pressure, Codex still has to hold half a gigabyte.
+        let (mut small, state) = codex_ready();
+        for process in &mut small.processes {
+            if [210, 211, 212].contains(&process.pid) {
+                process.footprint_bytes = Some(10 << 20);
+            }
+        }
+        assert!(!restarts(&small, &state), "30 MB is not worth a restart");
 
         let (snapshot, mut recent) = codex_ready();
         recent.last_codex_restart_at = Some(snapshot.taken_at - 3600);
         assert!(!restarts(&snapshot, &recent), "restarted an hour ago");
+    }
+
+    #[test]
+    fn helper_trees_with_an_agent_shell_or_terminal_are_left_alone() {
+        let mut snapshot = machine();
+        // Orphan 400's worker runs a shell; a Claude helper has started a CLI agent.
+        snapshot.processes.push(crate::owners::tests::proc(
+            405,
+            401,
+            "/bin/zsh",
+            "zsh -c npm run dev",
+            60,
+            4,
+        ));
+        snapshot.processes.push(crate::owners::tests::proc(
+            123,
+            122,
+            "/Users/u/.local/bin/claude",
+            "claude -p review",
+            5000,
+            200,
+        ));
+        snapshot.pressure = Pressure::Critical;
+        let state = aged(&mut snapshot, 20 * 60);
+        let ownership = Ownership::new(&snapshot, &state.known_helpers);
+        assert_eq!(
+            rules(&plan(&snapshot, &ownership, &state)),
+            [(Rule::Orphan, 402), (Rule::IdleClaudeSession, 121),]
+        );
+    }
+
+    #[test]
+    fn a_session_whose_child_started_within_the_window_is_working() {
+        let mut snapshot = machine();
+        snapshot.pressure = Pressure::Warning;
+        // A command the session started 20 minutes ago, exec'd without a shell.
+        snapshot.processes.push(crate::owners::tests::proc(
+            124,
+            120,
+            "/Users/u/.cargo/bin/cargo",
+            "cargo build",
+            20 * 60,
+            300,
+        ));
+        let mut state = aged(&mut snapshot, 61 * 60);
+        state.known_helpers.clear();
+        let ownership = Ownership::new(&snapshot, &state.known_helpers);
+        assert!(
+            !rules(&plan(&snapshot, &ownership, &state))
+                .iter()
+                .any(|(rule, _)| *rule == Rule::IdleClaudeSession)
+        );
     }
 }

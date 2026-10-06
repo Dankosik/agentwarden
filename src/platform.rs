@@ -13,6 +13,10 @@ pub fn home() -> Result<PathBuf, AppError> {
 
 #[cfg(target_os = "macos")]
 pub fn system() -> Result<impl System, AppError> {
+    // As root, `uid` checks would admit other users' and system processes.
+    if nix::unistd::geteuid().is_root() {
+        return Err(AppError::Root);
+    }
     Ok(macos::MacOs { home: home()? })
 }
 
@@ -50,10 +54,11 @@ impl System for NoSystem {
 #[cfg(target_os = "macos")]
 pub mod macos {
     use std::{
-        fs, io,
+        fs,
+        io::{self, Read},
         path::{Path, PathBuf},
-        process::Command,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        process::{Command, Stdio},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use nix::{
@@ -72,21 +77,62 @@ pub mod macos {
         pub home: PathBuf,
     }
 
+    /// A system command that has not finished by then is stuck; under heavy
+    /// swapping `top` takes seconds, not tens of seconds.
+    const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Run a system command in US English, so dates and numbers have the format
+    /// the parsers read whatever the user's language, and give up when it
+    /// hangs. Not the C locale: `ps` then escapes non-ASCII bytes in paths.
     fn run(program: &str, args: &[&str]) -> Result<String, AppError> {
-        let output = Command::new(program)
+        let failed = |source| AppError::Command {
+            program: program.to_owned(),
+            source,
+        };
+        let mut child = Command::new(program)
             .args(args)
-            .output()
-            .map_err(|source| AppError::Command {
-                program: program.to_owned(),
-                source,
-            })?;
-        if !output.status.success() {
+            .env("LC_ALL", "en_US.UTF-8")
+            .env("LANG", "en_US.UTF-8")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(failed)?;
+        // Read concurrently: `ps` output overflows the pipe buffer.
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| failed(io::Error::other("no stdout")))?;
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(failed)? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::CommandTimedOut {
+                    program: program.to_owned(),
+                    seconds: COMMAND_TIMEOUT.as_secs(),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let bytes = reader
+            .join()
+            .map_err(|_| failed(io::Error::other("output reader panicked")))?
+            .map_err(failed)?;
+        if !status.success() {
             return Err(AppError::CommandFailed {
                 program: program.to_owned(),
-                status: output.status.to_string(),
+                status: status.to_string(),
             });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn unix_now() -> u64 {
@@ -115,14 +161,23 @@ pub mod macos {
         fn snapshot(&self) -> Result<Snapshot, AppError> {
             let rows = probe::ps_rows(&run(
                 "/bin/ps",
-                &["-axww", "-o", "pid=,ppid=,uid=,tty=,time=,etime=,lstart="],
-            )?);
+                &[
+                    "-axww",
+                    "-o",
+                    "pid=,ppid=,uid=,tty=,state=,time=,etime=,lstart=",
+                ],
+            )?)
+            .ok_or_else(|| AppError::Unreadable {
+                program: "/bin/ps".into(),
+            })?;
             let exes = probe::pid_column(&run("/bin/ps", &["-axww", "-o", "pid=,comm="])?);
             let mut args = probe::pid_column(&run("/bin/ps", &["-axww", "-o", "pid=,args="])?);
             let footprints =
                 probe::top_footprints(&run("/usr/bin/top", &["-l", "1", "-stats", "pid,mem"])?);
             let processes = rows
                 .into_iter()
+                // A zombie has exited already; nothing can stop it again.
+                .filter(|row| !row.zombie)
                 .filter_map(|row| {
                     // A process that exited between the commands is skipped.
                     let exe = exes.get(&row.pid)?.clone();
@@ -162,8 +217,8 @@ pub mod macos {
                     .and_then(|text| probe::hid_idle_secs(&text)),
                 codex_activity_at: codex_activity_at(&self.home),
                 launchd_jobs: run("/bin/launchctl", &["list"])
-                    .map(|text| probe::launchd_pids(&text))
-                    .unwrap_or_default(),
+                    .ok()
+                    .map(|text| probe::launchd_pids(&text)),
                 mcp_servers,
                 processes,
             })
@@ -178,6 +233,10 @@ pub mod macos {
         }
 
         fn signal(&self, pid: i32, signal: Signal) -> io::Result<()> {
+            // 0 and negative PIDs address process groups; 1 is launchd.
+            if pid <= 1 {
+                return Err(io::Error::other(format!("refusing to signal PID {pid}")));
+            }
             let signal = match signal {
                 Signal::Term => NixSignal::SIGTERM,
                 Signal::Kill => NixSignal::SIGKILL,
@@ -186,15 +245,12 @@ pub mod macos {
         }
 
         fn launch_app(&self, bundle: &Path) -> io::Result<()> {
-            let status = Command::new("/usr/bin/open")
-                .args(["-g", "-j", "-a"])
-                .arg(bundle)
-                .status()?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other(format!("open exited with {status}")))
-            }
+            run(
+                "/usr/bin/open",
+                &["-g", "-j", "-a", &bundle.to_string_lossy()],
+            )
+            .map(drop)
+            .map_err(|error| io::Error::other(error.to_string()))
         }
 
         fn sleep(&self, duration: Duration) {
@@ -208,26 +264,29 @@ pub mod macos {
 
     /// Install or remove the per-user LaunchAgent that runs `watch`.
     pub fn install(home: &Path, uninstall: bool) -> Result<String, AppError> {
+        if nix::unistd::geteuid().is_root() {
+            return Err(AppError::Root);
+        }
         let label = crate::install::LABEL;
         let plist = home.join(format!("Library/LaunchAgents/{label}.plist"));
         let domain = format!("gui/{}", getuid().as_raw());
         let service = format!("{domain}/{label}");
-        let loaded = || {
-            Command::new("/bin/launchctl")
-                .args(["print", &service])
-                .output()
-                .is_ok_and(|output| output.status.success())
-        };
+        let loaded = || run("/bin/launchctl", &["print", &service]).is_ok();
         let io_error = |source| AppError::Install(source);
         if uninstall {
-            if loaded() {
-                let _ = run("/bin/launchctl", &["bootout", &service]);
-            }
+            let stopped = if loaded() {
+                run("/bin/launchctl", &["bootout", &service]).map(drop)
+            } else {
+                Ok(())
+            };
             match fs::remove_file(&plist) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(io_error(error)),
             }
+            // A failed bootout leaves the agent running until logout; say so
+            // instead of "removed".
+            stopped?;
             return Ok(format!("removed {label}"));
         }
         let exe = std::env::current_exe()

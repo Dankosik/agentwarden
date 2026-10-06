@@ -49,10 +49,15 @@ pub struct Session {
 #[derive(Debug)]
 pub struct CodexApp {
     pub pid: i32,
-    /// Helper servers of the Codex runtimes inside the app.
+    /// Codex runtimes inside the app, such as the app server.
+    pub runtimes: Vec<i32>,
+    /// Helper servers of those runtimes: configured MCP servers and helpers
+    /// bundled with the app.
     pub pools: Vec<i32>,
-    /// Age of the youngest shell or `codex exec` started inside the app, if any.
-    pub youngest_activity_secs: Option<u64>,
+    /// Work in progress inside the app: shells, `codex exec`, and any other
+    /// child of a runtime. A shell that runs one command execs it, so a running
+    /// `cargo test` is a runtime's direct child, not a shell's.
+    pub commands: Vec<i32>,
 }
 
 pub struct Ownership<'a> {
@@ -124,30 +129,49 @@ impl<'a> Ownership<'a> {
         }
 
         if let Some(app) = app {
+            let bundle = app
+                .exe
+                .strip_suffix("Contents/MacOS/ChatGPT")
+                .unwrap_or(&app.exe);
             let runtimes: Vec<i32> = in_app
                 .iter()
                 .copied()
                 .filter(|pid| self.process(*pid).is_some_and(is_codex))
                 .collect();
-            let pools = runtimes
+            let (pools, mut commands): (Vec<i32>, Vec<i32>) = runtimes
                 .iter()
                 .flat_map(|pid| self.helper_children(*pid))
-                .collect();
-            let youngest_activity_secs = in_app
-                .iter()
-                .filter_map(|pid| self.process(*pid))
-                .filter(|process| {
-                    is_shell(process) || (is_codex(process) && process.args.contains(" exec"))
+                .partition(|pid| {
+                    self.process(*pid).is_some_and(|process| {
+                        // A generic signature such as `npx` would also match
+                        // `npx vitest`; such a child counts as work.
+                        process.exe.starts_with(bundle)
+                            || snapshot
+                                .mcp_servers
+                                .iter()
+                                .any(|server| server.is_distinctive() && server.matches(process))
+                    })
+                });
+            commands.extend(in_app.iter().copied().filter(|pid| {
+                self.process(*pid).is_some_and(|process| {
+                    is_shell(process)
+                        || (is_codex(process)
+                            && process.args.split_whitespace().any(|word| word == "exec"))
                 })
-                .map(|process| process.age_secs)
-                .min();
+            }));
+            commands.sort_unstable();
             self.codex_app = Some(CodexApp {
                 pid: app.pid,
+                runtimes,
                 pools,
-                youngest_activity_secs,
+                commands,
             });
         }
 
+        // Without the launchd job list a service cannot be told from an orphan.
+        let Some(launchd_jobs) = &snapshot.launchd_jobs else {
+            return;
+        };
         self.orphans = snapshot
             .processes
             .iter()
@@ -158,12 +182,12 @@ impl<'a> Ownership<'a> {
                     && process.age_secs >= ORPHAN_MIN_AGE_SECS
                     && !is_agent_host(process)
                     && !is_shell(process)
-                    && !snapshot.launchd_jobs.contains(&process.pid)
+                    && !launchd_jobs.contains(&process.pid)
                     && (known_helpers.contains(&process.identity())
                         || snapshot
                             .mcp_servers
                             .iter()
-                            .any(|server| server.matches(process)))
+                            .any(|server| server.is_distinctive() && server.matches(process)))
             })
             .map(|process| process.pid)
             .collect();
@@ -220,7 +244,9 @@ impl<'a> Ownership<'a> {
             .sum()
     }
 
-    /// Every process currently serving an agent, for the history of known helpers.
+    /// Helper roots currently serving an agent, for the history of known
+    /// helpers. Only roots: a helper's descendant may detach on purpose to be
+    /// shared, such as a language server daemon, and is not the helper itself.
     pub fn helper_identities(&self) -> BTreeSet<Identity> {
         let roots = self
             .claude_sessions
@@ -229,27 +255,25 @@ impl<'a> Ownership<'a> {
             .chain(&self.codex_runtime_helpers)
             .chain(self.codex_app.iter().flat_map(|app| app.pools.iter()));
         let mut identities: BTreeSet<Identity> = roots
-            .flat_map(|root| self.tree(*root))
+            .filter_map(|root| self.process(*root))
             .map(Process::identity)
             .collect();
         // The app's own native helpers outlive a quit; remembering them lets the
-        // orphan rule reclaim them after a restart. Commands run by shells and
-        // the Codex runtimes themselves are not helpers.
+        // orphan rule reclaim them after a restart.
         if let Some(app) = &self.codex_app {
-            let mut stack = vec![app.pid];
-            while let Some(pid) = stack.pop() {
-                for child in self.children.get(&pid).into_iter().flatten() {
-                    if let Some(process) = self.process(*child)
-                        && !is_shell(process)
-                        && !is_agent_host(process)
-                    {
-                        identities.insert(process.identity());
-                        stack.push(*child);
-                    }
-                }
-            }
+            identities.extend(
+                self.helper_children(app.pid)
+                    .into_iter()
+                    .filter_map(|pid| self.process(pid).map(Process::identity)),
+            );
         }
         identities
+    }
+
+    /// A process no rule may signal: an agent, a shell, or one with a terminal.
+    pub fn is_protected(&self, pid: i32) -> bool {
+        self.process(pid)
+            .is_none_or(|process| is_agent_host(process) || is_shell(process) || process.has_tty)
     }
 }
 
@@ -378,7 +402,7 @@ pub(crate) mod tests {
         Snapshot {
             taken_at: 1_791_290_000,
             user: 501,
-            launchd_jobs: vec![300, 301],
+            launchd_jobs: Some(vec![300, 301]),
             mcp_servers: vec![
                 ServerSignature {
                     command: "/Users/u/.local/bin/codegraph".into(),
@@ -417,8 +441,10 @@ pub(crate) mod tests {
 
         let app = ownership.codex_app.as_ref().unwrap();
         assert_eq!(app.pid, 200);
+        assert_eq!(app.runtimes, [210]);
         assert_eq!(app.pools, [211, 212]);
-        assert_eq!(app.youngest_activity_secs, Some(40));
+        // The shell running `rg` is work in progress, not a pool.
+        assert_eq!(app.commands, [213]);
 
         // 300/301 are launchd jobs, 403 is inside its grace period.
         assert_eq!(ownership.orphans, [400, 402]);
@@ -442,7 +468,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn helper_history_covers_whole_helper_trees() {
+    fn helper_history_keeps_helper_roots_only() {
         let snapshot = machine();
         let ownership = Ownership::new(&snapshot, &BTreeSet::new());
         let pids: Vec<i32> = ownership
@@ -473,5 +499,82 @@ pub(crate) mod tests {
         let ownership = Ownership::new(&after, &known);
         assert!(ownership.orphans.contains(&215));
         assert!(ownership.codex_app.is_none());
+    }
+
+    #[test]
+    fn commands_under_the_codex_app_are_work_not_pools() {
+        let mut snapshot = machine();
+        snapshot.processes.retain(|p| p.pid != 213);
+        // `zsh -lc 'cargo test'` execs cargo, so it is the runtime's child.
+        snapshot.processes.push(proc(
+            216,
+            210,
+            "/Users/u/.cargo/bin/cargo",
+            "cargo test",
+            3600,
+            300,
+        ));
+        // A bundled helper is a pool; `exec-server` is a runtime, not a command.
+        snapshot.processes.push(proc(
+            217,
+            210,
+            "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+            "node_repl",
+            1900,
+            40,
+        ));
+        snapshot.processes.push(proc(
+            218,
+            200,
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/Codex",
+            "codex exec-server --remote x",
+            2000,
+            30,
+        ));
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        let app = ownership.codex_app.as_ref().unwrap();
+        assert_eq!(app.pools, [211, 212, 217]);
+        assert_eq!(app.commands, [216]);
+
+        // With `npx` configured as an MCP server, `npx vitest` is still work.
+        snapshot.processes.push(proc(
+            219,
+            210,
+            "/opt/homebrew/bin/npx",
+            "npx vitest",
+            7200,
+            90,
+        ));
+        snapshot.mcp_servers.push(crate::model::ServerSignature {
+            command: "npx".into(),
+            args: Vec::new(),
+        });
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert_eq!(ownership.codex_app.as_ref().unwrap().commands, [216, 219]);
+        assert_eq!(app.runtimes, [210, 218]);
+    }
+
+    #[test]
+    fn generic_signatures_and_unknown_launchd_state_find_no_orphans() {
+        let mut snapshot = machine();
+        // A user's detached `node server.js` matches a configured `node server.js`.
+        snapshot.processes.push(proc(
+            404,
+            1,
+            "/usr/local/bin/node",
+            "node server.js",
+            5000,
+            90,
+        ));
+        snapshot.mcp_servers.push(crate::model::ServerSignature {
+            command: "node".into(),
+            args: vec!["server.js".into()],
+        });
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert_eq!(ownership.orphans, [400]);
+
+        snapshot.launchd_jobs = None;
+        let ownership = Ownership::new(&snapshot, &known_gopls());
+        assert!(ownership.orphans.is_empty());
     }
 }

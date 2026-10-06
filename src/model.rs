@@ -68,8 +68,9 @@ pub struct Snapshot {
     pub user_idle_secs: Option<u64>,
     /// Unix time of the newest Codex session (rollout) write.
     pub codex_activity_at: Option<u64>,
-    /// PIDs that launchd runs as jobs; they are services, not orphans.
-    pub launchd_jobs: Vec<i32>,
+    /// PIDs that launchd runs as jobs; they are services, not orphans. `None`
+    /// when `launchctl` could not tell, which suspends the orphan rule.
+    pub launchd_jobs: Option<Vec<i32>>,
     /// Command and arguments of MCP servers configured for Claude Code and Codex.
     pub mcp_servers: Vec<ServerSignature>,
     pub processes: Vec<Process>,
@@ -81,7 +82,20 @@ pub struct ServerSignature {
     pub args: Vec<String>,
 }
 
+/// Launchers that run many unrelated programs; their name says nothing.
+const GENERIC_COMMANDS: [&str; 22] = [
+    "node", "nodejs", "npx", "npm", "pnpm", "pnpx", "yarn", "bun", "bunx", "deno", "python",
+    "python3", "uv", "uvx", "pipx", "docker", "podman", "java", "env", "sh", "bash", "zsh",
+];
+
 impl ServerSignature {
+    /// Whether a match alone is evidence that a process is this server: a
+    /// specific program with its arguments, not a generic launcher.
+    pub fn is_distinctive(&self) -> bool {
+        let name = self.command.rsplit('/').next().unwrap_or(&self.command);
+        !self.args.is_empty() && !GENERIC_COMMANDS.contains(&name)
+    }
+
     /// True when `process` runs this server, directly or through a launcher.
     ///
     /// A launcher such as `codegraph` may exec an interpreter, so the command

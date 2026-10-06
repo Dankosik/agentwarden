@@ -16,7 +16,12 @@ pub const IDLE_CPU_CENTIS_PER_MINUTE: u64 = 50;
 /// Swap growth below this between passes is noise, not a trend.
 const SWAP_GROWTH_SLACK_BYTES: u64 = 64 << 20;
 
+/// Passes run about a minute apart; a longer gap means the Mac slept or
+/// agentwarden was stopped, and says nothing about whether a session worked.
+pub const SAMPLE_GAP_SECS: u64 = 3 * 60;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct State {
     /// Processes seen serving a live agent; they stay known after orphaning.
     pub known_helpers: BTreeSet<Identity>,
@@ -39,26 +44,26 @@ pub fn session_key(identity: &Identity) -> String {
 }
 
 impl State {
-    /// Pressure rules act on: the kernel's level, raised by swap trends.
+    /// Pressure rules act on: the kernel's level, raised to Warning while swap
+    /// grows. How full swap is says nothing: macOS adds swap files as needed,
+    /// so the space it has allocated is nearly always nearly full.
     pub fn effective_pressure(&self, snapshot: &Snapshot) -> Pressure {
-        let swap = snapshot.swap;
-        let from_swap = if swap.total_bytes > 0 && swap.used_bytes * 10 >= swap.total_bytes * 9 {
-            Pressure::Critical
-        } else if self
+        let growing = self
             .last_swap_used_bytes
-            .is_some_and(|last| swap.used_bytes > last + SWAP_GROWTH_SLACK_BYTES)
-        {
-            Pressure::Warning
+            .is_some_and(|last| snapshot.swap.used_bytes > last + SWAP_GROWTH_SLACK_BYTES);
+        if growing {
+            snapshot.pressure.max(Pressure::Warning)
         } else {
-            Pressure::Normal
-        };
-        snapshot.pressure.max(from_swap)
+            snapshot.pressure
+        }
     }
 
-    /// Seconds the session has been idle, or `None` before it was first sampled.
+    /// Seconds the session has been idle, or `None` before it was first sampled
+    /// and on the first pass after a gap, which proves nothing either way.
     pub fn session_idle_secs(&self, identity: &Identity, now: u64) -> Option<u64> {
         self.sessions
             .get(&session_key(identity))
+            .filter(|activity| now.saturating_sub(activity.sampled_at) <= SAMPLE_GAP_SECS)
             .map(|activity| now.saturating_sub(activity.active_at))
     }
 
@@ -78,9 +83,18 @@ impl State {
             let key = session_key(&process.identity());
             let activity = match self.sessions.get(&key) {
                 Some(previous) => {
-                    let minutes = now.saturating_sub(previous.sampled_at).max(1).div_ceil(60);
+                    let elapsed = now.saturating_sub(previous.sampled_at).max(1);
                     let spent = process.cpu_centis.saturating_sub(previous.cpu_centis);
-                    let busy = spent > IDLE_CPU_CENTIS_PER_MINUTE * minutes;
+                    // A process started since the last pass is a tool call, even
+                    // when it cost the session itself little CPU.
+                    let started_something = ownership
+                        .descendants(session.pid)
+                        .into_iter()
+                        .filter_map(|pid| ownership.process(pid))
+                        .any(|child| child.age_secs <= elapsed);
+                    let busy = elapsed > SAMPLE_GAP_SECS
+                        || started_something
+                        || spent * 60 > IDLE_CPU_CENTIS_PER_MINUTE * elapsed;
                     SessionActivity {
                         cpu_centis: process.cpu_centis,
                         sampled_at: now,
@@ -121,8 +135,10 @@ mod tests {
         assert_eq!(state.effective_pressure(&snapshot), Pressure::Normal);
         state.last_swap_used_bytes = Some(3 << 30);
         assert_eq!(state.effective_pressure(&snapshot), Pressure::Warning);
+        // Allocated swap 92% used but not growing: macOS just has not added a file.
         snapshot.swap.used_bytes = (5.5 * (1u64 << 30) as f64) as u64;
-        assert_eq!(state.effective_pressure(&snapshot), Pressure::Critical);
+        state.last_swap_used_bytes = Some(snapshot.swap.used_bytes);
+        assert_eq!(state.effective_pressure(&snapshot), Pressure::Normal);
         snapshot.swap = Swap::default();
         snapshot.pressure = Pressure::Warning;
         assert_eq!(state.effective_pressure(&snapshot), Pressure::Warning);
@@ -142,6 +158,12 @@ mod tests {
             .find(|p| p.pid == 110)
             .unwrap()
             .identity();
+        // Its shell and command started long ago; ages stay fixed in this fixture.
+        for process in &mut snapshot.processes {
+            if [113, 114].contains(&process.pid) {
+                process.age_secs = 10_000;
+            }
+        }
         let start = snapshot.taken_at;
         observe(&mut state, &snapshot);
         assert_eq!(state.session_idle_secs(&session, start), Some(0));
@@ -191,6 +213,91 @@ mod tests {
                 .known_helpers
                 .iter()
                 .any(|identity| identity.pid == 121)
+        );
+    }
+
+    #[test]
+    fn sleep_gaps_and_new_tool_processes_are_not_idleness() {
+        let mut snapshot = machine();
+        let mut state = State::default();
+        let observe = |state: &mut State, snapshot: &crate::model::Snapshot| {
+            let ownership = Ownership::new(snapshot, &BTreeSet::new());
+            state.observe(snapshot, &ownership);
+        };
+        let session = snapshot
+            .processes
+            .iter()
+            .find(|p| p.pid == 120)
+            .unwrap()
+            .identity();
+        observe(&mut state, &snapshot);
+        for _ in 0..10 {
+            snapshot.taken_at += 66;
+            observe(&mut state, &snapshot);
+        }
+        assert_eq!(
+            state.session_idle_secs(&session, snapshot.taken_at),
+            Some(660)
+        );
+
+        // The lid was closed for 8 hours: the first pass after it decides nothing,
+        // and the session's clock starts again.
+        snapshot.taken_at += 8 * 3600;
+        assert_eq!(state.session_idle_secs(&session, snapshot.taken_at), None);
+        observe(&mut state, &snapshot);
+        assert_eq!(
+            state.session_idle_secs(&session, snapshot.taken_at),
+            Some(0)
+        );
+
+        // A respawned MCP server means a tool call happened.
+        snapshot.taken_at += 600;
+        for _ in 0..5 {
+            snapshot.taken_at += 60;
+            observe(&mut state, &snapshot);
+        }
+        snapshot.taken_at += 60;
+        snapshot.processes.push(crate::owners::tests::proc(
+            125,
+            120,
+            "/opt/homebrew/bin/gopls",
+            "gopls mcp",
+            20,
+            50,
+        ));
+        observe(&mut state, &snapshot);
+        assert_eq!(
+            state.session_idle_secs(&session, snapshot.taken_at),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn idle_tolerance_follows_the_real_pass_interval() {
+        let mut snapshot = machine();
+        let mut state = State::default();
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        state.observe(&snapshot, &ownership);
+        let session = snapshot
+            .processes
+            .iter()
+            .find(|p| p.pid == 120)
+            .unwrap()
+            .identity();
+        // 0.6 s in 66 s is above 0.5 s per minute: working.
+        snapshot.taken_at += 66;
+        snapshot
+            .processes
+            .iter_mut()
+            .find(|p| p.pid == 120)
+            .unwrap()
+            .cpu_centis += 60;
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        state.observe(&snapshot, &ownership);
+        snapshot.taken_at += 60;
+        assert_eq!(
+            state.session_idle_secs(&session, snapshot.taken_at),
+            Some(60)
         );
     }
 }
