@@ -1,16 +1,31 @@
-//! CLI composition and a small reusable streaming core.
+//! agentwarden keeps idle AI coding agent helpers from filling a Mac's memory.
 
+mod actions;
 mod cli;
-mod config;
 mod error;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod install;
+mod model;
 mod output;
-pub mod stats;
+mod owners;
+mod platform;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod probe;
+mod report;
+mod rules;
+mod state;
+mod store;
 
-use std::{fs::File, io, io::Write, path::Path, process::ExitCode};
+use std::{io, io::Write, process::ExitCode, time::Duration};
 
 use clap::{CommandFactory, Parser};
 
-use crate::{cli::Cli, error::AppError};
+use crate::{actions::System, cli::Cli, error::AppError, store::Store};
+
+const WATCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Exit status of `reclaim` when at least one action failed.
+const PARTIAL: u8 = 3;
 
 /// Parse process arguments, perform the requested command, and report once.
 pub fn run() -> ExitCode {
@@ -19,7 +34,7 @@ pub fn run() -> ExitCode {
         Err(error) => return report_parser_error(error),
     };
     match execute(cli, &mut io::stdout().lock()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) if error.is_stdout_closed() => ExitCode::SUCCESS,
         Err(error) => {
             let mut stderr = io::stderr().lock();
@@ -31,7 +46,7 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), AppError> {
+fn execute(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
     match cli.command {
         cli::Command::Completions { shell } => {
             let mut command = Cli::command();
@@ -40,23 +55,57 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), AppError> {
             // known command definition in memory, then handle stdout ourselves.
             let mut bytes = Vec::new();
             clap_complete::generate(shell, &mut command, name, &mut bytes);
-            output::write_bytes(stdout, &bytes)
+            output::write_bytes(stdout, &bytes)?;
+            Ok(ExitCode::SUCCESS)
         }
-        cli::Command::Stats { input } => {
-            let format = config::resolve_format(cli.format, cli.config.as_deref())?;
-            let stats = if input == Path::new("-") {
-                stats::count(&mut io::stdin().lock()).map_err(AppError::Stdin)?
+        cli::Command::Status => {
+            let (system, store) = environment()?;
+            let report = report::pass(&system, &store, false)?;
+            output::report(stdout, &report, cli.format)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        cli::Command::Reclaim { dry_run } => {
+            let (system, store) = environment()?;
+            let report = report::pass(&system, &store, !dry_run)?;
+            output::report(stdout, &report, cli.format)?;
+            Ok(if report.has_failures() {
+                ExitCode::from(PARTIAL)
             } else {
-                let read_error = |source| AppError::Input {
-                    path: input.clone(),
-                    source,
-                };
-                let mut file = File::open(&input).map_err(read_error)?;
-                stats::count(&mut file).map_err(read_error)?
-            };
-            output::summary(stdout, &stats, format)
+                ExitCode::SUCCESS
+            })
+        }
+        cli::Command::Watch => {
+            let (system, store) = environment()?;
+            loop {
+                // One failed pass must not stop the next; launchd keeps stderr.
+                if let Err(error) = report::pass(&system, &store, true) {
+                    let mut stderr = io::stderr().lock();
+                    let _ = writeln!(stderr, "pass failed: {}", error::diagnostic(&error));
+                }
+                system.sleep(WATCH_INTERVAL);
+            }
+        }
+        cli::Command::Install { uninstall } => {
+            let message = install(uninstall)?;
+            output::line(stdout, &message)?;
+            Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn environment() -> Result<(impl System, Store), AppError> {
+    let system = platform::system()?;
+    Ok((system, Store::for_home(&platform::home()?)))
+}
+
+#[cfg(target_os = "macos")]
+fn install(uninstall: bool) -> Result<String, AppError> {
+    platform::macos::install(&platform::home()?, uninstall)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install(_uninstall: bool) -> Result<String, AppError> {
+    Err(AppError::Unsupported)
 }
 
 fn report_parser_error(mut error: clap::Error) -> ExitCode {

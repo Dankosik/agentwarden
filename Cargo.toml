@@ -30,6 +30,10 @@ log = "0.4.34"
 tempfile = "3.27.0"
 walkdir = "2.5.0"
 
+# Process signals on macOS; std has no safe signal API.
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["signal", "user"] }
+
 [dev-dependencies]
 assert_cmd = "2.2.2"
 
