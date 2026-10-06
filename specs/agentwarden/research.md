@@ -73,6 +73,9 @@ the daemon socket remains a follow-up, not a blocker.
 
 ## R3: machine-wide build admission
 
+Out of agentwarden's scope since 2026-10-06 (owner decision); kept as
+evidence for a later tool.
+
 Experiment: two `cargo build` runs of this crate, each with a fresh target
 directory, started together under `nice -n 10`. A sampler counted `rustc`
 processes every 100 ms.
