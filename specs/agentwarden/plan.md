@@ -104,6 +104,6 @@ As of 2026-10-06, branch `feat/agentwarden`:
 | T11 | Done | Idle sessions 0.2–0.45 s CPU per minute; tolerance 0.5 s ([research](research.md)) |
 | T13 | Done by R1 | Same Claude Code version (2.1.286) as the R1 experiment |
 | T9 | Done | With the owner's approval: `cargo install`, `agentwarden install` twice (second a no-op), `launchctl print` shows it running; its first pass stopped one orphaned codegraph tree (0.09 GB) |
-| T14 | Running | One-hour observation of an idle Codex |
+| T14 | Done | 65 idle minutes: no session writes, no shell or `codex exec`; the activity signal stays quiet ([research](research.md)) |
 | T15 | Done | SIGTERM quit in under 1 s, no prompt; background relaunch; Codex threads intact ([research](research.md)) |
 | T17 | Pending | Happens when the conditions first hold; read the action log |

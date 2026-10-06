@@ -191,3 +191,14 @@ the rules never stop because it is a Codex runtime, and the app's native
 `bare-modifier-monitor`, which the new app started a second copy of. The
 helper history now includes the app's own non-shell, non-runtime descendants,
 so such leftovers are reclaimed by the orphan rule after a restart.
+
+**T14: an idle Codex for one hour.** Sampled once a minute from 15:35 to
+16:39 while the owner did not use Codex (the app was restarted for T15 at
+15:46). No session file was written for 65 minutes. The app-server's only
+lasting child was its `codex-code-mode-host`; a second copy appeared briefly
+three times. Once, at 15:53, the relaunched app started its pool of 22
+processes (servers and one `git`), which settled within two minutes. No shell
+and no `codex exec` started, so the activity signal stayed quiet, and the
+hidden-thread pools of
+[openai/codex#43971](https://github.com/openai/codex/issues/43971) did not
+appear in this version.
