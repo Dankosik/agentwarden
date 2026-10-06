@@ -101,12 +101,13 @@ def smoke(executable, info):
     )
     if result.stdout.strip() != f"{info.binary} {info.version}".encode() or result.stderr:
         raise ValueError("extracted binary has unexpected version output")
+    # Completions need no system access, so every packaged target can run them.
     result = subprocess.run(
-        [str(executable), "--format", "json", "stats", "-"],
-        input=b"one\ntwo\nlast", capture_output=True, timeout=10, check=True,
+        [str(executable), "completions", "bash"],
+        capture_output=True, timeout=10, check=True,
     )
-    if result.stdout != b'{"bytes":12,"lines":2}\n' or result.stderr:
-        raise ValueError("extracted binary failed the streaming CLI smoke test")
+    if f"_{info.binary}()".encode() not in result.stdout or result.stderr:
+        raise ValueError("extracted binary failed the completions smoke test")
 
 
 def inspect_archive(archive, info, target, destination=None):

@@ -8,7 +8,7 @@ implementation directly to a checked result.
 
 | Current decision | Read when needed |
 | --- | --- |
-| Add or replace a command | [First command](first-command.md), affected parser/dispatch/tests |
+| Add or replace a command | [Architecture](architecture.md), affected parser/dispatch/tests |
 | Understand ownership or public behavior | [Architecture](architecture.md) and affected callers |
 | Reuse a mechanism or select a dependency | Matching [library-guide](library-guide.md) row and selected API |
 | Measure a resource claim | [Performance](performance.md); a code-only audit can report bounds and hypotheses |

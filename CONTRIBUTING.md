@@ -6,7 +6,7 @@ version. Remove secrets and personal data from reproductions. For an improvement
 explain the user need and the behavior that would change.
 
 Use the toolchain declared by `rust-toolchain.toml`. Start with the README's
-quickstart; consult the [first-command guide](docs/first-command.md) when adding
+instructions; consult the [architecture](docs/architecture.md) when adding
 or replacing a command. Coding agents follow [AGENTS.md](AGENTS.md).
 
 Keep changes focused and preserve existing CLI contracts unless explicitly

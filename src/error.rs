@@ -1,25 +1,27 @@
-use std::{io, path::PathBuf};
+use std::io;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AppError {
-    #[error("cannot read input {path:?}: {source}")]
-    Input {
-        path: PathBuf,
+    #[cfg(not(target_os = "macos"))]
+    #[error("agentwarden supports macOS only")]
+    Unsupported,
+    #[error("HOME is not set")]
+    NoHome,
+    #[cfg(target_os = "macos")]
+    #[error("cannot run {program}: {source}")]
+    Command {
+        program: String,
         #[source]
         source: io::Error,
     },
-    #[error("cannot read standard input: {0}")]
-    Stdin(#[source] io::Error),
-    #[error("cannot read config {path:?}: {source}")]
-    ConfigRead {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("config {path:?} exceeds the {limit}-byte limit")]
-    ConfigTooLarge { path: PathBuf, limit: u64 },
-    #[error("invalid config {path:?}: {message}")]
-    ConfigParse { path: PathBuf, message: String },
+    #[cfg(target_os = "macos")]
+    #[error("{program} failed: {status}")]
+    CommandFailed { program: String, status: String },
+    #[error("cannot write agentwarden state or log: {0}")]
+    Store(#[source] io::Error),
+    #[cfg(target_os = "macos")]
+    #[error("cannot install the LaunchAgent: {0}")]
+    Install(#[source] io::Error),
     #[error("cannot encode JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("cannot write standard output: {0}")]
@@ -53,7 +55,7 @@ mod tests {
     #[test]
     fn only_stdout_broken_pipe_is_a_clean_pipeline_end() {
         assert!(AppError::Output(io::ErrorKind::BrokenPipe.into()).is_stdout_closed());
-        assert!(!AppError::Stdin(io::ErrorKind::BrokenPipe.into()).is_stdout_closed());
+        assert!(!AppError::Store(io::ErrorKind::BrokenPipe.into()).is_stdout_closed());
         assert!(!AppError::Output(io::ErrorKind::PermissionDenied.into()).is_stdout_closed());
     }
 

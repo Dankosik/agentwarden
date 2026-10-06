@@ -49,10 +49,9 @@ python3 scripts/release.py package --target aarch64-apple-darwin --dist dist
 Packaging derives the binary name and version from `cargo metadata`. It
 includes the binary, `README.md`, and `LICENSE`, plus `NOTICE`,
 `THIRD_PARTY_NOTICES`, and `THIRD_PARTY_NOTICES.md` when present. Keep required dependency notices current
-when changing the distribution's dependencies. The default smoke test runs
-`--version` and the sample `stats` command against bytes containing both
-terminated and unterminated lines. Replace that smoke case when replacing the
-sample command; retain a deterministic check of the real packaged command.
+when changing the distribution's dependencies. The smoke test runs
+`--version` and `completions bash`, which need no system access and so run on
+every packaged target; the commands that read processes are macOS-only.
 
 Packaging never cross-compiles or claims to test a foreign executable.
 `checksums` validates the full four-target inventory before writing

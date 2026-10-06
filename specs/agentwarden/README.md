@@ -168,18 +168,19 @@ grammar.
 | --- | --- | --- |
 | `agentwarden install` | Installs and starts the per-user LaunchAgent that runs `watch`; repeat runs are no-ops; `--uninstall` removes it | LaunchAgent plist |
 | `agentwarden watch` | The loop the LaunchAgent runs: every 60 s, sample, apply rules, log | Signals, log |
-| `agentwarden status` | Owners, footprint, age, idleness, pressure level, recent actions; `--json` for agents | Nothing |
+| `agentwarden status` | Owners, footprint, age, idleness, pressure level, recent actions; `--format json` for agents | Nothing |
 | `agentwarden reclaim` | One pass of the rules now; `--dry-run` prints the plan only | Signals, log |
 
-Exit status distinguishes success, nothing to do, partial application, and
-refusal.
+Exit status: 0 success or nothing to do, 1 error or unsupported platform,
+2 usage error, 3 `reclaim` with at least one failed action. Refused and skipped
+actions are outcomes in the log, not failures.
 
 ### Agent-first interface
 
 - The repository's README starts with the one command an agent runs to install
   and verify: build or download, then `agentwarden install`, then
-  `agentwarden status --json`.
-- `status --json` has a stable, documented schema: pressure level, owner tree
+  `agentwarden status --format json`.
+- `status --format json` has a stable schema, documented in the README: pressure level, owner tree
   with footprint, idle durations, and the last actions with their rule and
   recovered memory.
 - Diagnostics say what was refused and why, in a form an agent can act on.
@@ -205,7 +206,7 @@ refusal.
 | macOS first | All evidence and the owner's machine are macOS; footprint, pressure and launchd are platform-specific |
 | Zero configuration; pressure-adaptive defaults in code | The owner requires that no person configures it; agents install it |
 | Footprint, not RSS, as the cost metric | RSS hides swapped memory (R4) |
-| Footprint is read with the `libproc` crate (`proc_pid_rusage`) | Reads all same-user processes without root in under 1 ms; `sysinfo` reports RSS (R4) |
+| Footprint is read from `top -l 1 -stats pid,mem` | Its MEM column equals `phys_footprint` (matched on six processes); `libproc`, chosen in R4, was dropped at implementation because its `bindgen` build dependency needs BSD-3-Clause and ISC licenses outside `deny.toml` and a libclang build |
 | `unsafe_code = "forbid"` stays | Native calls come through a maintained crate or a system command |
 | Idleness is a session property, not a server property | Rules stay tool- and language-neutral; a server can be busy with its own work while unused |
 | Claude Code session servers may be stopped when the session is idle | Claude Code restarts a stopped server on the next call (R1) |
@@ -221,13 +222,13 @@ Evidence and method for each gate are in [research](research.md).
 | R1 | What happens when an idle session's MCP server is stopped? | Claude Code 2.1.286 restarts it on the next tool call (run twice). Codex 0.160.0 fails calls with "not connected" until an MCP refresh (source) |
 | R2 | Can Codex MCP children be attributed to threads? | Not from outside the app. No thread marker in the process or its environment; the desktop app-server speaks stdio to the app |
 | R3 | Does a machine-wide FIFO jobserver bound concurrent builds? | Yes, through `CARGO_MAKEFLAGS`; now out of scope |
-| R4 | How to read true memory without root or `unsafe`? | `proc_pid_rusage` via the `libproc` crate, 0.8 ms for 541 processes |
+| R4 | How to read true memory without root or `unsafe`? | `proc_pid_rusage` works (0.8 ms for 541 processes); implemented with `top`, which reports the same value |
 | R5 | Does a multiplexer remove duplicate configurable servers? | Estimated 50 → 28 processes; not needed for the zero-configuration design |
 
 Remaining checks belong to implementation, not to new gates:
 
-- Measure a Claude Code session's CPU time while it waits, to set the "not
-  grown" tolerance.
+- Done 2026-10-06: a waiting Claude Code session spends 0.2–0.45 s of CPU per
+  minute; the idle tolerance is 0.5 s per minute (T11 in [research](research.md)).
 - Confirm on each stage that the Claude Code version in use still restarts
   stopped servers; a release that stops doing so disables the idle rule.
 - Observe an idle Codex for one hour: which rollout writes and processes

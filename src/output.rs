@@ -1,20 +1,25 @@
 use std::io::Write;
 
-use crate::{cli::Format, error::AppError, stats::Stats};
+use crate::{cli::Format, error::AppError, report::Report};
 
-pub(crate) fn summary(
+pub(crate) fn report(
     writer: &mut impl Write,
-    stats: &Stats,
+    report: &Report,
     format: Format,
 ) -> Result<(), AppError> {
-    let mut bytes = match format {
-        Format::Text => format!("bytes: {}\nlines: {}", stats.bytes, stats.lines).into_bytes(),
-        // This record has two scalar counts; buffering it is bounded independently
-        // of input size, and keeps serialization errors distinct from stdout I/O.
-        Format::Json => serde_json::to_vec(stats)?,
+    let bytes = match format {
+        Format::Text => crate::report::text(report).into_bytes(),
+        Format::Json => {
+            let mut bytes = serde_json::to_vec(report)?;
+            bytes.push(b'\n');
+            bytes
+        }
     };
-    bytes.push(b'\n');
     write_bytes(writer, &bytes)
+}
+
+pub(crate) fn line(writer: &mut impl Write, text: &str) -> Result<(), AppError> {
+    write_bytes(writer, format!("{text}\n").as_bytes())
 }
 
 pub(crate) fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<(), AppError> {
@@ -26,19 +31,7 @@ pub(crate) fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<(), A
 mod tests {
     use std::io::{self, Write};
 
-    use super::{Format, Stats, summary};
-
-    #[test]
-    fn output_has_stable_bytes_and_field_order() {
-        for (format, expected) in [
-            (Format::Text, &b"bytes: 5\nlines: 2\n"[..]),
-            (Format::Json, &b"{\"bytes\":5,\"lines\":2}\n"[..]),
-        ] {
-            let mut output = Vec::new();
-            summary(&mut output, &Stats { bytes: 5, lines: 2 }, format).unwrap();
-            assert_eq!(output, expected);
-        }
-    }
+    use super::write_bytes;
 
     struct ShortWriter {
         bytes: Vec<u8>,
@@ -66,12 +59,12 @@ mod tests {
             bytes: Vec::new(),
             flush_error: Some(io::ErrorKind::PermissionDenied),
         };
-        let error = summary(&mut writer, &Stats::default(), Format::Json).unwrap_err();
-        assert_eq!(writer.bytes, b"{\"bytes\":0,\"lines\":0}\n");
+        let error = write_bytes(&mut writer, b"{\"a\":1}\n").unwrap_err();
+        assert_eq!(writer.bytes, b"{\"a\":1}\n");
         assert!(!error.is_stdout_closed());
         writer.flush_error = Some(io::ErrorKind::BrokenPipe);
         assert!(
-            summary(&mut writer, &Stats::default(), Format::Text)
+            write_bytes(&mut writer, b"x")
                 .unwrap_err()
                 .is_stdout_closed()
         );

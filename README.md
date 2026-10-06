@@ -1,77 +1,104 @@
 # agentwarden
 
-Resource governor for macOS workstations running parallel AI coding agents
+Keeps a Mac that runs many AI coding agents (Claude Code, Codex) from filling
+its memory with idle agent helpers. It needs no configuration: an agent
+installs it once, and it runs in the background from then on.
 
-Status: in definition. The [specification](specs/agentwarden/README.md) states
-the problem, evidence, scope, and research gates; the command below is still
-the template's example.
+Status: macOS only. [Specification](specs/agentwarden/README.md) ·
+[research](specs/agentwarden/research.md) · [plan](specs/agentwarden/plan.md) ·
+[architecture](docs/architecture.md)
 
-[Repository](https://github.com/Dankosik/agentwarden) · [Architecture](docs/architecture.md) ·
-[Development guide](docs/first-command.md)
+## For agents: install and verify
 
-## Build and run
-
-Install [Rust through rustup](https://rust-lang.org/tools/install/). The checked-in
-toolchain selects the compiler, rustfmt, and Clippy versions.
-
-```sh
-git clone https://github.com/Dankosik/agentwarden.git
-cd agentwarden
-cargo test --locked
-cargo build --locked --release
-cargo run --locked -- --help
-```
-
-The executable is `target/release/agentwarden` (`agentwarden.exe` on Windows).
-To install from your local checkout:
+Run these from a checkout of this repository on the user's Mac. Rust comes
+from [rustup](https://rust-lang.org/tools/install/); the checked-in toolchain
+selects the version.
 
 ```sh
 cargo install --path . --locked
+agentwarden install
+agentwarden status --format json
 ```
 
-The initial demonstration command counts bytes and LF terminators without
-retaining the input. Replace this example and its tests with your utility's
-behavior:
+`install` writes `~/Library/LaunchAgents/io.github.dankosik.agentwarden.plist`
+and starts it; it is idempotent and repeats safely after a rebuild. The agent
+runs `agentwarden watch`, which applies the rules every 60 seconds at
+background priority. Nothing asks the user anything, and there is no
+configuration file.
 
-```sh
-agentwarden stats README.md
-agentwarden --format json stats README.md
-agentwarden completions bash
-```
+To remove it: `agentwarden install --uninstall`.
 
-Explicit format selection overrides `AGENTWARDEN_FORMAT`, then an
-explicit TOML config, then text output. `--config` overrides
-`AGENTWARDEN_CONFIG`. Config is never loaded implicitly from your home
-directory. See [architecture](docs/architecture.md) for the full starter contract.
+## What it does
+
+Every pass samples processes, their physical footprint (compressed and swapped
+memory included, as `top` reports it), kernel memory pressure, swap, and how
+long the user has been away. Then it applies four rules:
+
+| Rule | Stops | When |
+| --- | --- | --- |
+| `orphan` | A helper whose agent session has exited (PPID 1), with its descendants | Always, once the helper is 2 minutes old |
+| `idle-claude-session` | The MCP servers of a Claude Code session that has done nothing | Idle 60 min under warning pressure, 15 min under critical; never under normal pressure |
+| `idle-codex-restart` | The ChatGPT app that hosts Codex, quit and relaunched in the background | Codex idle 30 min, user away 30 min, Codex helpers ≥ 1 GB or warning pressure, at most once per 6 hours |
+| Codex helpers one by one | Never | Codex reports a stopped server as "not connected" until it refreshes |
+
+Why these are safe: Claude Code starts a stopped MCP server again on the next
+tool call; Codex saves threads to disk, so a restart loses no thread; an orphan
+has no session left to use it. Measurements are in the
+[research](specs/agentwarden/research.md).
+
+Safety rules:
+
+- A process is signalled only after its PID and start time are checked again,
+  so a reused PID is never hit.
+- Only the current user's processes, never one with a terminal, never a
+  launchd service, never an agent itself.
+- Children stop before parents: SIGTERM, then SIGKILL after 5 seconds.
+- The app is only asked to quit; if it has not quit within 60 seconds, the
+  restart is abandoned and recorded, never forced.
+
+## Commands
+
+| Command | Effect |
+| --- | --- |
+| `agentwarden status` | Who holds memory, what the rules would do now, recent actions. Writes nothing |
+| `agentwarden reclaim [--dry-run]` | One pass now; `--dry-run` prints the plan only |
+| `agentwarden watch` | The loop the LaunchAgent runs |
+| `agentwarden install [--uninstall]` | Install or remove the LaunchAgent |
+| `agentwarden completions <shell>` | Shell completion script |
+
+`--format json` (or `AGENTWARDEN_FORMAT=json`) prints one JSON object:
+
+| Field | Meaning |
+| --- | --- |
+| `taken_at` | Unix time of the sample |
+| `pressure`, `kernel_pressure` | `normal`, `warning`, `critical`; `pressure` is the kernel level raised by swap trends, which the rules use |
+| `swap` | `used_bytes`, `total_bytes` |
+| `user_idle_secs` | Seconds since keyboard or pointer input |
+| `claude_sessions[]` | `pid`, `idle_secs` (null until sampled twice), `helpers_footprint_bytes`, `helpers[]` |
+| `codex` | `app_pid`, `idle_secs`, `pools_footprint_bytes`, `pools[]`; null when the app is not running |
+| `orphans[]` | `pid`, `exe_name`, `footprint_bytes` (with descendants), `age_secs` |
+| `planned[]` | Actions the rules choose now: `kind` `stop` or `restart-codex`, `rule`, targets, `footprint_bytes`, `reason` |
+| `applied[]` | What this run did: `outcome` `stopped`, `skipped`, `failed`, `restarted` or `refused` |
+| `recent[]` | Newest records of the action log |
+
+Exit status: 0 success or nothing to do, 1 error (including an unsupported
+platform), 2 usage error, 3 `reclaim` finished with at least one failed action.
+
+Files: state and the action log (`actions.jsonl`) live in
+`~/Library/Application Support/agentwarden/`; the LaunchAgent's errors go to
+`~/Library/Logs/agentwarden.log`.
 
 ## Development
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+make check
+cargo run --locked -- status
+cargo run --locked -- reclaim --dry-run
 ```
 
-`make template-check` checks instructions, pinned skills, documentation links,
-and maintenance tools (Python 3.9+). `make verify` combines these with the Rust
-checks; equivalent successful checks need not be repeated. Coding agents start
-with [AGENTS.md](AGENTS.md) and load only relevant vendored Rust skills. [First command](docs/first-command.md) explains how to
-replace the example and its release smoke check.
+Rules are pure functions of recorded snapshots and are tested without touching
+the machine; tests never install the LaunchAgent. See
+[contributing](CONTRIBUTING.md) and [agent workflow](docs/agent-workflow.md).
 
-The [library guide](docs/library-guide.md) maps common CLI work to the predeclared
-toolbox and additional crates. Consult the matching entry when adding technical
-mechanics or choosing a dependency; known project/std APIs do not require a full
-catalog review. The [research record](docs/research/2026-09-08-cli-libraries.md)
-preserves dated evidence, not a mandatory reading list.
-
-See [performance](docs/performance.md), [releases](docs/releasing.md),
-[contributing](CONTRIBUTING.md), and [security](SECURITY.md) for their respective
-contracts. Source publication to crates.io is initially disabled; native binary
-releases use the configured GitHub workflow.
-
-## Origin and license
-
-Initialized from [Dankosik/rust-cli-template](https://github.com/Dankosik/rust-cli-template),
-with methods from [Dankosik/rust-cli-skills](https://github.com/Dankosik/rust-cli-skills).
-
-[MIT license](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md)
+Built from [rust-cli-template](https://github.com/Dankosik/rust-cli-template).
+Licensed under [MIT](LICENSE).

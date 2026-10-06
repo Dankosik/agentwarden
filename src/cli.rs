@@ -1,25 +1,19 @@
-use std::path::PathBuf;
-
-use clap::{Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use serde::Deserialize;
 
 #[derive(Debug, Parser)]
 #[command(version, about, arg_required_else_help = true)]
 pub(crate) struct Cli {
-    /// Output format (precedence: flag, environment, config, text)
+    /// Output format (precedence: flag, environment, text)
     #[arg(
         long,
         global = true,
         env = "AGENTWARDEN_FORMAT",
         hide_env_values = true,
-        value_enum
+        value_enum,
+        default_value_t = Format::Text
     )]
-    pub format: Option<Format>,
-
-    /// Read this TOML configuration file; no files are loaded automatically
-    #[arg(long, global = true, env = "AGENTWARDEN_CONFIG", hide_env_values = true, value_hint = ValueHint::FilePath)]
-    pub config: Option<PathBuf>,
+    pub format: Format,
 
     #[command(subcommand)]
     pub command: Command,
@@ -27,14 +21,21 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Count bytes and LF newline terminators, using bounded memory
-    #[command(
-        long_about = "Count bytes and LF (0x0A) newline terminators, like wc -l.\nA final unterminated fragment adds bytes but no line. Input need not be UTF-8."
-    )]
-    Stats {
-        /// Input file, or - for standard input
-        #[arg(default_value = "-", value_hint = ValueHint::FilePath)]
-        input: PathBuf,
+    /// Show who holds memory, what the rules would do now, and recent actions
+    Status,
+    /// Apply the rules once now
+    Reclaim {
+        /// Print the plan without stopping or restarting anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Apply the rules every 60 seconds; the LaunchAgent runs this
+    Watch,
+    /// Install the per-user LaunchAgent that runs `watch` (idempotent)
+    Install {
+        /// Stop and remove the LaunchAgent instead
+        #[arg(long)]
+        uninstall: bool,
     },
     /// Write a shell completion script to stdout
     Completions {
@@ -43,8 +44,7 @@ pub(crate) enum Command {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub(crate) enum Format {
     #[default]
     Text,
@@ -53,39 +53,21 @@ pub(crate) enum Format {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
-    use super::Cli;
+    use super::{Cli, Command, Format};
 
     #[test]
     fn command_definition_is_consistent() {
         Cli::command().debug_assert();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn parser_preserves_non_utf8_paths_without_filesystem_assumptions() {
-        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
-
-        use clap::Parser;
-
-        use super::Command;
-
-        let path = OsString::from_vec(b"input-\xff".to_vec());
-        let cli = Cli::try_parse_from([
-            OsString::from("agentwarden"),
-            OsString::from("--format"),
-            OsString::from("text"),
-            OsString::from("--config"),
-            path.clone(),
-            OsString::from("stats"),
-            path.clone(),
-        ])
-        .unwrap();
-        assert_eq!(cli.config.unwrap().into_os_string(), path);
-        match cli.command {
-            Command::Stats { input } => assert_eq!(input.into_os_string(), path),
-            Command::Completions { .. } => panic!("expected stats command"),
-        }
+    fn global_format_applies_to_every_command() {
+        let cli = Cli::try_parse_from(["agentwarden", "reclaim", "--dry-run", "--format", "json"])
+            .unwrap();
+        assert_eq!(cli.format, Format::Json);
+        assert!(matches!(cli.command, Command::Reclaim { dry_run: true }));
+        assert!(Cli::try_parse_from(["agentwarden", "--config", "x", "status"]).is_err());
     }
 }

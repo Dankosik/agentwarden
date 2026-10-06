@@ -1,74 +1,58 @@
 # Architecture
 
-The template is one synchronous command-line program. Its example command
-counts a file or stdin incrementally. Dependencies support a concrete CLI
-capability; there is no service container, network client, database, or background
-runtime to initialize before a command can run.
+agentwarden is one synchronous program. A pass samples the machine, decides,
+acts, and records; `watch` repeats a pass every 60 seconds. There is no async
+runtime, daemon framework, or configuration file. The
+[specification](../specs/agentwarden/README.md) owns behavior and the safety
+contract; this file owns where each responsibility lives.
 
 ## Responsibility boundaries
 
 | File | Owns |
 | --- | --- |
 | `src/main.rs` | Thin executable entry point |
-| `src/lib.rs` | Argument parsing, dispatch, process I/O, and final exit status |
-| `src/cli.rs` | Subcommands, flags, help, and the source for completions |
-| `src/config.rs` | Explicit file input, format precedence, and validation |
-| `src/stats.rs` | Streaming computation and its result type |
-| `src/output.rs` | Human or machine representation and output-write failures |
-| `src/error.rs` | Error types, diagnostic rendering, and closed-stdout classification |
-| `tests/cli.rs` | Actual executable arguments, streams, status, and effects |
+| `src/lib.rs` | Argument parsing, dispatch, the watch loop, final exit status |
+| `src/cli.rs` | Commands, flags, help, and the source for completions |
+| `src/platform.rs` | Every macOS call behind the `System` trait: `ps`, `top`, `sysctl`, `ioreg`, `launchctl`, signals, `open`, and the LaunchAgent install |
+| `src/probe.rs` | Pure parsers for those commands' output and for the agents' MCP configuration |
+| `src/model.rs` | The snapshot: processes, pressure, swap, idle time, Codex activity, MCP server signatures |
+| `src/owners.rs` | Ownership tree: Claude Code sessions and their helpers, Codex runtimes and the app, orphans |
+| `src/state.rs` | What passes remember: known helpers, session CPU activity, last swap, last Codex restart |
+| `src/rules.rs` | The rules and their constants, as pure functions of snapshot, ownership and state |
+| `src/actions.rs` | Revalidation, signalling, the Codex restart sequence, and the `System` trait |
+| `src/store.rs` | State file and the bounded action log |
+| `src/report.rs` | One pass (`pass`) and the report it prints |
+| `src/install.rs` | The LaunchAgent property list |
+| `src/output.rs` | Text or JSON on stdout, and output-write failures |
+| `src/error.rs` | Error types and diagnostic rendering |
+| `tests/cli.rs` | The built binary: grammar, status, framing |
 
-The parser is the authority for accepted command syntax. Cargo owns package
-identity, dependencies, and build settings. Generated output has a declared
-source and regeneration path. Add modules when their responsibilities differ;
-do not reproduce backend layers merely to arrange a small command.
+## Data flow
 
-## Input and resource ownership
+1. `platform` builds a `Snapshot`. Commands that fail fatally (`ps`, `top`)
+   abort the pass; optional signals (pressure, swap, idle, launchd jobs)
+   degrade to defaults that make rules more conservative.
+2. `owners` turns the flat process list into owners. Agent hosts are never
+   targets.
+3. `rules::plan` reads the snapshot, ownership and the previous state, and
+   returns actions. It has no side effects.
+4. `actions::execute` revalidates each target by PID and start time and acts.
+5. `state.observe` records this pass; `store` saves state atomically and
+   appends the action records.
 
-Use native path types for filesystem operations. File and stdin handles belong
-to the command invocation; the operation consumes a reader and retains only
-the state required by its algorithm. Keep input-dependent memory growth visible
-when extending that algorithm. A bounded read buffer does not bound a collection
-of every record.
+`status` and `reclaim --dry-run` stop after step 3 and write nothing.
 
-The statistics operation uses a 64 KiB read buffer and two counters. It counts
-bytes exactly and counts LF bytes as lines, without decoding UTF-8 or retaining
-whole lines. An unterminated final fragment adds bytes only. A read failure
-returns an error before the summary is written. This bounds the operation's
-input buffer, not the whole process's resident memory.
+## Testing
 
-Configuration files are explicit: `--config PATH` overrides
-`AGENTWARDEN_CONFIG`. Output format is selected by `--format`, then
-`AGENTWARDEN_FORMAT`, then the selected TOML file, then `text`.
-Unknown config fields and files larger than 64 KiB are rejected. An explicitly
-selected invalid file still fails even when a flag overrides its format.
+Rules, ownership, state, parsers and the executor are tested on recorded or
+synthetic snapshots and a fake `System`, so tests run on every platform and
+never signal real processes. `tests/cli.rs` runs the binary with a temporary
+`HOME`; on macOS it reads the real process table but never applies actions or
+installs the LaunchAgent. Live checks on the owner's machine are recorded in
+the [research](../specs/agentwarden/research.md).
 
-Keep startup paths cheap. Help, version, and completion generation should be
-available without reading the data stream or validating an unrelated config
-file. Resolve configuration only for operations that need it.
+## Platforms
 
-## Output and failure
-
-Result data goes to stdout; diagnostics go to stderr. The JSON summary is
-`{"bytes":N,"lines":N}` followed by one newline. Keep JSON free of human
-decoration and treat its fields and framing as a public contract. Successful
-commands return status 0; parser misuse returns 2; runtime failures return 1.
-A closed stdout pipe is a quiet success. Other input or output failures remain
-errors, including a broken pipe while reading input. Process exit and
-broken-pipe policy have one owner so individual commands cannot silently disagree.
-
-The template supplies a working baseline. Add file mutation, subprocesses,
-network access, or concurrency when a command requires them, and give each
-effect a clear failure and cleanup policy. Do not infer permission to publish
-or change external state from the presence of a library or credential.
-
-## Extending the repository
-
-Keep a useful operation callable independently of process setup. Reuse the
-existing parser and output path when adding a subcommand. Add tests at the
-boundary that can observe the promised behavior. See [first command](first-command.md)
-for the development path and [agent workflow](agent-workflow.md) for coordination.
-
-Repository instructions are shared through `AGENTS.md`. The vendored Rust CLI
-skills provide task-specific methods. Provider instruction files point to that
-shared source; they do not define competing project policies.
+Only macOS is implemented. Other platforms compile, and every command that
+needs the system exits with `agentwarden supports macOS only`. A port adds a
+`System` implementation and its probes; rules do not change.

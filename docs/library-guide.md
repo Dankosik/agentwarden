@@ -7,7 +7,7 @@ not already appear in Cargo.toml to be a valid choice. Use its API directly and
 keep local code for the command's actual policy or a demonstrated semantic gap.
 
 The template baseline is Rust **1.98.1**, edition 2024. The predeclared toolbox is
-intentional: it is ready for product commands even when the small `stats` example
+intentional: it is ready for product commands even when a product command
 does not use every dependency. No usage percentage is claimed. Import only what
 the implementation needs, and keep runtime initialization out of help/version.
 
