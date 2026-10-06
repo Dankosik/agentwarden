@@ -21,7 +21,7 @@ call a warmed measurement a cold-start result.
 ```sh
 cargo build --locked --release
 python3 -c 'from pathlib import Path; p=Path("benchmark-results"); p.mkdir(exist_ok=True); f=(p/"input.bin").open("wb"); chunk=b"x"*1023+b"\n"; [f.write(chunk*1024) for _ in range(64)]; f.close()'
-hyperfine --warmup 3 --runs 20 './target/release/rust-cli-template --help' './target/release/rust-cli-template --format json stats benchmark-results/input.bin'
+hyperfine --warmup 3 --runs 20 './target/release/agentwarden --help' './target/release/agentwarden --format json stats benchmark-results/input.bin'
 ```
 
 The fixture is 64 MiB with 65,536 LF terminators. Those commands measure two

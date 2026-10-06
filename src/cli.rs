@@ -11,14 +11,14 @@ pub(crate) struct Cli {
     #[arg(
         long,
         global = true,
-        env = "RUST_CLI_TEMPLATE_FORMAT",
+        env = "AGENTWARDEN_FORMAT",
         hide_env_values = true,
         value_enum
     )]
     pub format: Option<Format>,
 
     /// Read this TOML configuration file; no files are loaded automatically
-    #[arg(long, global = true, env = "RUST_CLI_TEMPLATE_CONFIG", hide_env_values = true, value_hint = ValueHint::FilePath)]
+    #[arg(long, global = true, env = "AGENTWARDEN_CONFIG", hide_env_values = true, value_hint = ValueHint::FilePath)]
     pub config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -73,7 +73,7 @@ mod tests {
 
         let path = OsString::from_vec(b"input-\xff".to_vec());
         let cli = Cli::try_parse_from([
-            OsString::from("rust-cli-template"),
+            OsString::from("agentwarden"),
             OsString::from("--format"),
             OsString::from("text"),
             OsString::from("--config"),

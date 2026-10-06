@@ -7,10 +7,10 @@ use std::{
 };
 
 fn command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rust-cli-template"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentwarden"));
     command
-        .env_remove("RUST_CLI_TEMPLATE_CONFIG")
-        .env_remove("RUST_CLI_TEMPLATE_FORMAT")
+        .env_remove("AGENTWARDEN_CONFIG")
+        .env_remove("AGENTWARDEN_FORMAT")
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -164,8 +164,8 @@ fn format_precedence_is_flag_environment_config_default() {
     successful(
         &run(
             command()
-                .env("RUST_CLI_TEMPLATE_CONFIG", &path)
-                .env("RUST_CLI_TEMPLATE_FORMAT", "text")
+                .env("AGENTWARDEN_CONFIG", &path)
+                .env("AGENTWARDEN_FORMAT", "text")
                 .arg("stats"),
             b"x\n",
         ),
@@ -174,8 +174,8 @@ fn format_precedence_is_flag_environment_config_default() {
     successful(
         &run(
             command()
-                .env("RUST_CLI_TEMPLATE_CONFIG", &path)
-                .env("RUST_CLI_TEMPLATE_FORMAT", "json")
+                .env("AGENTWARDEN_CONFIG", &path)
+                .env("AGENTWARDEN_FORMAT", "json")
                 .args(["stats", "--format", "text"]),
             b"x\n",
         ),
@@ -191,7 +191,7 @@ fn config_flag_overrides_environment_path() {
     let output = run(
         command()
             .env(
-                "RUST_CLI_TEMPLATE_CONFIG",
+                "AGENTWARDEN_CONFIG",
                 directory.path().join("absent.toml"),
             )
             .arg("--config")
@@ -278,7 +278,7 @@ fn invalid_arguments_and_environment_have_usage_status() {
     }
     let output = run(
         command()
-            .env("RUST_CLI_TEMPLATE_FORMAT", "yaml")
+            .env("AGENTWARDEN_FORMAT", "yaml")
             .arg("stats"),
         b"",
     );
@@ -296,7 +296,7 @@ fn parser_diagnostics_escape_untrusted_controls_even_with_forced_color() {
                 cmd.args(["stats", "--format", invalid]);
             }
             "environment" => {
-                cmd.env("RUST_CLI_TEMPLATE_FORMAT", invalid).arg("stats");
+                cmd.env("AGENTWARDEN_FORMAT", invalid).arg("stats");
             }
             "unknown-argument" => {
                 cmd.arg("stats").arg(format!("--bad{invalid}"));
@@ -324,8 +324,8 @@ fn help_keeps_trusted_layout_and_hides_untrusted_environment_values() {
         command()
             .env_remove("NO_COLOR")
             .env("CLICOLOR_FORCE", "1")
-            .env("RUST_CLI_TEMPLATE_FORMAT", "\u{1b}[2J\nFORGED_FORMAT")
-            .env("RUST_CLI_TEMPLATE_CONFIG", "\u{1b}[2J\nFORGED_CONFIG")
+            .env("AGENTWARDEN_FORMAT", "\u{1b}[2J\nFORGED_FORMAT")
+            .env("AGENTWARDEN_CONFIG", "\u{1b}[2J\nFORGED_CONFIG")
             .arg("--help"),
         b"",
     );
@@ -334,8 +334,8 @@ fn help_keeps_trusted_layout_and_hides_untrusted_environment_values() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains('\n'));
-    assert!(stdout.contains("RUST_CLI_TEMPLATE_FORMAT"));
-    assert!(stdout.contains("RUST_CLI_TEMPLATE_CONFIG"));
+    assert!(stdout.contains("AGENTWARDEN_FORMAT"));
+    assert!(stdout.contains("AGENTWARDEN_CONFIG"));
     assert!(!stdout.contains("\u{1b}[2J"));
     assert!(!stdout.contains("FORGED_FORMAT"));
     assert!(!stdout.contains("FORGED_CONFIG"));
@@ -366,7 +366,7 @@ fn informational_commands_do_not_open_config_or_read_stdin() {
     ] {
         let mut child = ChildGuard::spawn(
             command()
-                .env("RUST_CLI_TEMPLATE_CONFIG", directory.path().join("absent"))
+                .env("AGENTWARDEN_CONFIG", directory.path().join("absent"))
                 .args(args),
         );
         // Keep the pipe's writer alive through child termination. Reading stdin

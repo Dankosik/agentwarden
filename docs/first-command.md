@@ -47,9 +47,9 @@ Preserve native path values and end-of-options behavior. Ensure `--help` and
 `--version` do not read input, load unrelated configuration, or perform effects.
 Generated completions should continue to use the parser's command definition.
 
-The existing format precedence is `--format`, `RUST_CLI_TEMPLATE_FORMAT`, the
+The existing format precedence is `--format`, `AGENTWARDEN_FORMAT`, the
 selected TOML file, then `text`. A config file is selected only by `--config`
-or `RUST_CLI_TEMPLATE_CONFIG`; no home-directory files are searched implicitly.
+or `AGENTWARDEN_CONFIG`; no home-directory files are searched implicitly.
 The initializer renames this environment prefix with your executable identity.
 
 ## Prove the behavior

@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "name": "rust-cli-template",
-  "repository": "https://github.com/Dankosik/rust-cli-template",
-  "description": "A fast, small Rust command-line utility.",
-  "environment_prefix": "RUST_CLI_TEMPLATE",
-  "initialized": false
+  "name": "agentwarden",
+  "repository": "https://github.com/Dankosik/agentwarden",
+  "description": "Resource governor for macOS workstations running parallel AI coding agents",
+  "environment_prefix": "AGENTWARDEN",
+  "initialized": true
 }

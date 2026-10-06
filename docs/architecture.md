@@ -38,8 +38,8 @@ returns an error before the summary is written. This bounds the operation's
 input buffer, not the whole process's resident memory.
 
 Configuration files are explicit: `--config PATH` overrides
-`RUST_CLI_TEMPLATE_CONFIG`. Output format is selected by `--format`, then
-`RUST_CLI_TEMPLATE_FORMAT`, then the selected TOML file, then `text`.
+`AGENTWARDEN_CONFIG`. Output format is selected by `--format`, then
+`AGENTWARDEN_FORMAT`, then the selected TOML file, then `text`.
 Unknown config fields and files larger than 64 KiB are rejected. An explicitly
 selected invalid file still fails even when a flag overrides its format.
 

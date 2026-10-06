@@ -1,11 +1,11 @@
 [package]
-name = "rust-cli-template"
+name = "agentwarden"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
-description = "A fast, small Rust command-line utility."
+description = "Resource governor for macOS workstations running parallel AI coding agents"
 license = "MIT"
-repository = "https://github.com/Dankosik/rust-cli-template"
+repository = "https://github.com/Dankosik/agentwarden"
 publish = false
 
 [dependencies]
