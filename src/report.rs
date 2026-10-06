@@ -97,11 +97,13 @@ pub fn pass(system: &dyn System, store: &Store, apply: bool) -> Result<Report, A
         state.last_codex_restart_at = Some(snapshot.taken_at);
     }
     state.observe(&snapshot, &ownership);
-    // State first: it holds the restart gate, and the log only reports.
-    store.save_state(&state).map_err(AppError::Store)?;
+    // Both are attempted: state holds the restart gate, the log the record of
+    // what was done. A failed log write does not fail the pass.
+    let saved = store.save_state(&state).map_err(AppError::Store);
     if let Err(error) = store.append(&applied) {
         let _ = writeln!(io::stderr(), "cannot append to the action log: {error}");
     }
+    saved?;
     Ok(Report {
         applied,
         recent: store.recent(RECENT_RECORDS),

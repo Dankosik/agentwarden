@@ -81,8 +81,9 @@ pub mod macos {
     /// swapping `top` takes seconds, not tens of seconds.
     const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Run a system command in the C locale, so its output has the format the
-    /// parsers read whatever the user's language, and give up when it hangs.
+    /// Run a system command in US English, so dates and numbers have the format
+    /// the parsers read whatever the user's language, and give up when it
+    /// hangs. Not the C locale: `ps` then escapes non-ASCII bytes in paths.
     fn run(program: &str, args: &[&str]) -> Result<String, AppError> {
         let failed = |source| AppError::Command {
             program: program.to_owned(),
@@ -90,8 +91,8 @@ pub mod macos {
         };
         let mut child = Command::new(program)
             .args(args)
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
+            .env("LC_ALL", "en_US.UTF-8")
+            .env("LANG", "en_US.UTF-8")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -263,6 +264,9 @@ pub mod macos {
 
     /// Install or remove the per-user LaunchAgent that runs `watch`.
     pub fn install(home: &Path, uninstall: bool) -> Result<String, AppError> {
+        if nix::unistd::geteuid().is_root() {
+            return Err(AppError::Root);
+        }
         let label = crate::install::LABEL;
         let plist = home.join(format!("Library/LaunchAgents/{label}.plist"));
         let domain = format!("gui/{}", getuid().as_raw());
@@ -270,15 +274,19 @@ pub mod macos {
         let loaded = || run("/bin/launchctl", &["print", &service]).is_ok();
         let io_error = |source| AppError::Install(source);
         if uninstall {
-            // A failed bootout leaves the agent running; say so instead of "removed".
-            if loaded() {
-                run("/bin/launchctl", &["bootout", &service])?;
-            }
+            let stopped = if loaded() {
+                run("/bin/launchctl", &["bootout", &service]).map(drop)
+            } else {
+                Ok(())
+            };
             match fs::remove_file(&plist) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(io_error(error)),
             }
+            // A failed bootout leaves the agent running until logout; say so
+            // instead of "removed".
+            stopped?;
             return Ok(format!("removed {label}"));
         }
         let exe = std::env::current_exe()

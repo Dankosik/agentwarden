@@ -230,7 +230,14 @@ distribution) and the live action log. Confirmed on the owner's machine:
   most of it `top`.
 
 0.1.1 fixes the defects that could stop work in progress or misread the
-machine. Left for a later release: helper CPU as a sign of an in-flight MCP
+machine. `ps` runs under `en_US.UTF-8`, not `C`: in the C locale it escapes
+non-ASCII bytes of paths (checked with a Cyrillic directory name). On the
+Claude side, a child started within the idle window marks the session busy;
+a command that a session exec'd without a shell and that has run longer than
+the window is not recognised, but Claude Code's Bash tool does not exec (its
+wrapper ends with `&& pwd -P`), and requiring a configured signature for
+every Claude helper would miss plugin and forwarded servers. Left for a later
+release: helper CPU as a sign of an in-flight MCP
 call, relaunching an app that quit after the 60-second wait, release
 attestations and immutable releases, and serving `install.sh` from the
 release.

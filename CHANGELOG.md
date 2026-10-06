@@ -30,11 +30,12 @@ stop work in progress.
 - After the Mac sleeps, or any gap between passes, idle time starts again
   instead of counting the sleep; 0.1.0 could stop servers the moment the user
   came back.
-- A Claude Code session that starts a process, or runs any shell, is working;
+- A Claude Code session with a process it started within the idle window, or
+  any running shell, is working;
   the idle CPU tolerance follows the real interval between passes.
 - Swap filling its allocated size no longer means critical pressure; macOS
   keeps allocated swap nearly full.
-- System commands run in the C locale, so `status` and `reclaim` read the
+- System commands run in US English, so `status` and `reclaim` read the
   machine correctly under any system language; an unreadable process table
   fails the pass instead of looking empty.
 - System commands time out after 30 seconds instead of stalling the watcher.
@@ -44,7 +45,8 @@ stop work in progress.
 - Zombie processes are skipped; when `launchctl` cannot list jobs, the orphan
   rule waits for the next pass; PIDs 0 and 1 are never signalled;
   agentwarden refuses to run as root.
-- `install --uninstall` reports an error if the agent could not be stopped.
+- `install --uninstall` removes the LaunchAgent and reports an error if the
+  agent could not be stopped; `install` refuses to run as root.
 
 ### Added
 

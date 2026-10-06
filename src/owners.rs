@@ -143,11 +143,13 @@ impl<'a> Ownership<'a> {
                 .flat_map(|pid| self.helper_children(*pid))
                 .partition(|pid| {
                     self.process(*pid).is_some_and(|process| {
+                        // A generic signature such as `npx` would also match
+                        // `npx vitest`; such a child counts as work.
                         process.exe.starts_with(bundle)
                             || snapshot
                                 .mcp_servers
                                 .iter()
-                                .any(|server| server.matches(process))
+                                .any(|server| server.is_distinctive() && server.matches(process))
                     })
                 });
             commands.extend(in_app.iter().copied().filter(|pid| {
@@ -533,6 +535,22 @@ pub(crate) mod tests {
         let app = ownership.codex_app.as_ref().unwrap();
         assert_eq!(app.pools, [211, 212, 217]);
         assert_eq!(app.commands, [216]);
+
+        // With `npx` configured as an MCP server, `npx vitest` is still work.
+        snapshot.processes.push(proc(
+            219,
+            210,
+            "/opt/homebrew/bin/npx",
+            "npx vitest",
+            7200,
+            90,
+        ));
+        snapshot.mcp_servers.push(crate::model::ServerSignature {
+            command: "npx".into(),
+            args: Vec::new(),
+        });
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert_eq!(ownership.codex_app.as_ref().unwrap().commands, [216, 219]);
         assert_eq!(app.runtimes, [210, 218]);
     }
 

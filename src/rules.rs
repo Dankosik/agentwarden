@@ -95,12 +95,14 @@ pub fn plan(snapshot: &Snapshot, ownership: &Ownership<'_>, state: &State) -> Ve
             let Some(idle) = state.session_idle_secs(&process.identity(), now) else {
                 continue;
             };
-            // A running command, however old, means the session is working.
+            // A running shell, however old, or anything started within the
+            // window means the session is working. A shell that runs a single
+            // command execs it, so a long command can be a direct child.
             let busy_shell = ownership
                 .descendants(session.pid)
                 .into_iter()
                 .filter_map(|pid| ownership.process(pid))
-                .any(is_shell);
+                .any(|child| is_shell(child) || child.age_secs < window);
             if idle < window || busy_shell {
                 continue;
             }
@@ -396,6 +398,29 @@ mod tests {
         assert_eq!(
             rules(&plan(&snapshot, &ownership, &state)),
             [(Rule::Orphan, 402), (Rule::IdleClaudeSession, 121),]
+        );
+    }
+
+    #[test]
+    fn a_session_whose_child_started_within_the_window_is_working() {
+        let mut snapshot = machine();
+        snapshot.pressure = Pressure::Warning;
+        // A command the session started 20 minutes ago, exec'd without a shell.
+        snapshot.processes.push(crate::owners::tests::proc(
+            124,
+            120,
+            "/Users/u/.cargo/bin/cargo",
+            "cargo build",
+            20 * 60,
+            300,
+        ));
+        let mut state = aged(&mut snapshot, 61 * 60);
+        state.known_helpers.clear();
+        let ownership = Ownership::new(&snapshot, &state.known_helpers);
+        assert!(
+            !rules(&plan(&snapshot, &ownership, &state))
+                .iter()
+                .any(|(rule, _)| *rule == Rule::IdleClaudeSession)
         );
     }
 }
