@@ -1,0 +1,23 @@
+{
+  "source": "https://github.com/Dankosik/rust-cli-skills",
+  "revision": "aa14d4147af6bb5b58533389cd2ba52455459790",
+  "license": "MIT",
+  "files": {
+    ".agents/skills/rust-build/SKILL.md": "3d1866a62f94924ae47c6207afbc9e50876629274e1e254a455219c8e05e91c5",
+    ".agents/skills/rust-cli-interface/SKILL.md": "5f4f2e41baa2d15a35de5536ac7b96fcd86d5bb1cd75a241c3c80c115b1e26ef",
+    ".agents/skills/rust-cli-testing/SKILL.md": "7d30f021b2b00120859d3a0ba0313890ab7f419d2e4130d8e007ecb4881b95bd",
+    ".agents/skills/rust-concurrency/SKILL.md": "0e9c0f52b1a3050b86e33678284c532b12a0ea521a0bb2631a69e8429a57b653",
+    ".agents/skills/rust-debugging/SKILL.md": "244676371b834c8e981429a42833520a74ae15203f108c5cf0955268fc47f45c",
+    ".agents/skills/rust-design/SKILL.md": "81ab81eb2d77365c660a52730e27af3587d41afc99510e39d6cc7524efb89e71",
+    ".agents/skills/rust-distribution/SKILL.md": "61ad9bd3bc723a2192fa45896354627bb037dc0a194ec81364c6185ec9803648",
+    ".agents/skills/rust-errors/SKILL.md": "61495aeb2664673fd14c6b1d24bb5d96e57e14227837d29c66ef48de1021c0aa",
+    ".agents/skills/rust-filesystem/SKILL.md": "5667b666d6668ba06a7d4ac5bfccd7703f6bceb0024f5048fc306a391c3d7a0a",
+    ".agents/skills/rust-idiomatic/SKILL.md": "1b21eeef927cae9d266731a159bbcd6e2dcebade9d93ae1899e62b5a1e29b98f",
+    ".agents/skills/rust-implement/SKILL.md": "169f998710260ef859d3938d80972c186c788825499194e6ca636eb9ff6805e4",
+    ".agents/skills/rust-io/SKILL.md": "d0df93afea9b96dd53fbb5f6f75a95ef031730b4bd35ead2654aaafa7f50ed71",
+    ".agents/skills/rust-memory/SKILL.md": "3d8f39dc8ac418eea610ff940b0a466d59a96176b557ec27c07479bba490d036",
+    ".agents/skills/rust-performance/SKILL.md": "a176e340218f487e30d66ca7d8b8d7a44dfc56bdb28e8776b481cffe7092d6a8",
+    ".agents/skills/rust-processes/SKILL.md": "59e98b889d26ef64f70ccae109877555ac5bba86c2004f1afad46e73660590e4",
+    ".agents/skills/rust-testing/SKILL.md": "167f9a9fcf5f0e8c2d562ca5824380dfcf7aae54b4ebb300e2cd78b863709ea2"
+  }
+}
