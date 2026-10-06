@@ -103,7 +103,7 @@ As of 2026-10-06, branch `feat/agentwarden`:
 | T7 | Done | Live `reclaim`: 6 orphaned codegraph trees (12 processes), 1.55 GB footprint, logged |
 | T11 | Done | Idle sessions 0.2–0.45 s CPU per minute; tolerance 0.5 s ([research](research.md)) |
 | T13 | Done by R1 | Same Claude Code version (2.1.286) as the R1 experiment |
-| T9 | Waiting for the owner | Installing a LaunchAgent changes the owner's login items |
+| T9 | Done | With the owner's approval: `cargo install`, `agentwarden install` twice (second a no-op), `launchctl print` shows it running; its first pass stopped one orphaned codegraph tree (0.09 GB) |
 | T14 | Running | One-hour observation of an idle Codex |
 | T15 | Done | SIGTERM quit in under 1 s, no prompt; background relaunch; Codex threads intact ([research](research.md)) |
-| T17 | After T9 and T15 | Happens when the conditions first hold |
+| T17 | Pending | Happens when the conditions first hold; read the action log |
