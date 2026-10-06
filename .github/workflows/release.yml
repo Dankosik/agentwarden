@@ -28,6 +28,10 @@ jobs:
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     defaults:
       run:
         shell: bash
@@ -56,6 +60,11 @@ jobs:
       - run: cargo build --release --locked --target "$RELEASE_TARGET"
       - name: Package and smoke-test the extracted binary
         run: python scripts/release.py package --target "$RELEASE_TARGET" --dist dist
+      - name: Attest build provenance of the archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
@@ -99,7 +108,7 @@ jobs:
           python scripts/release.py check-tag --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
           python scripts/release.py checksums --dist dist
           python scripts/release.py notes > "$RUNNER_TEMP/notes.md"
-      - name: Create release with every archive and checksum
+      - name: Create release with every archive, checksum and the installer
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -107,5 +116,8 @@ jobs:
           if [[ "$RELEASE_TAG" == *-* ]]; then
             extra+=(--prerelease)
           fi
-          gh release create "$RELEASE_TAG" dist/* --repo "$RELEASE_REPOSITORY" --verify-tag \
+          # Assets go in while the release is a draft; publishing makes an
+          # immutable release final.
+          gh release create "$RELEASE_TAG" dist/* install.sh --repo "$RELEASE_REPOSITORY" --verify-tag --draft \
             --title "agentwarden $RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.md" "${extra[@]}"
+          gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft=false

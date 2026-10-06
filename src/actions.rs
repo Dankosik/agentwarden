@@ -1,6 +1,10 @@
 //! Carry out planned actions safely and record what happened.
 
-use std::{io, path::Path, time::Duration};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::{
     error::AppError,
@@ -12,6 +16,8 @@ use crate::{
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const KILL_GRACE: Duration = Duration::from_secs(2);
 pub const APP_QUIT_TIMEOUT: Duration = Duration::from_secs(60);
+const QUIT_TIMED_OUT: &str = "app did not quit within 60 s; not forced";
+const RELAUNCH_FAILED: &str = "quit, but relaunch failed";
 const POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,15 +152,51 @@ fn restart(
     // Never force the app: an app that does not quit is left as it is.
     if !wait_gone(system, &[app], user, APP_QUIT_TIMEOUT) {
         record.outcome = Outcome::Refused;
-        record.detail = Some("app did not quit within 60 s; not forced".into());
+        record.detail = Some(QUIT_TIMED_OUT.into());
         return record;
     }
     match system.launch_app(bundle) {
         Ok(()) => record.outcome = Outcome::Restarted,
         Err(error) => {
             record.outcome = Outcome::Failed;
-            record.detail = Some(format!("quit, but relaunch failed: {error}"));
+            record.detail = Some(format!("{RELAUNCH_FAILED}: {error}"));
         }
+    }
+    record
+}
+
+/// The app bundle to open later when a restart asked the app to quit but did
+/// not see it start again: it quit after the wait, or `open` failed.
+pub fn left_quit(action: &Action, record: &Record) -> Option<PathBuf> {
+    let Action::RestartCodex { app_exe, .. } = action else {
+        return None;
+    };
+    let detail = record.detail.as_deref().unwrap_or_default();
+    let quit_requested = (record.outcome == Outcome::Refused && detail == QUIT_TIMED_OUT)
+        || (record.outcome == Outcome::Failed && detail.starts_with(RELAUNCH_FAILED));
+    quit_requested
+        .then(|| app_bundle(app_exe).map(Path::to_owned))
+        .flatten()
+}
+
+/// Open an app that a restart left quit.
+pub fn relaunch(system: &dyn System, bundle: &Path) -> Record {
+    let name = bundle
+        .file_stem()
+        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+    let mut record = Record {
+        at: system.now(),
+        rule: "idle-codex-restart".into(),
+        outcome: Outcome::Restarted,
+        target: name,
+        pids: Vec::new(),
+        footprint_bytes: 0,
+        reason: "relaunch after the app quit late".into(),
+        detail: None,
+    };
+    if let Err(error) = system.launch_app(bundle) {
+        record.outcome = Outcome::Failed;
+        record.detail = Some(format!("relaunch failed: {error}"));
     }
     record
 }
@@ -367,6 +409,26 @@ pub(crate) mod tests {
         assert_eq!(*system.signals.borrow(), [(200, Signal::Term)]);
         assert!(system.launched.borrow().is_empty());
         assert!(*system.slept.borrow() >= super::APP_QUIT_TIMEOUT);
+    }
+
+    #[test]
+    fn an_app_that_quits_late_is_left_for_a_later_relaunch() {
+        let mut slow = system(&[200]);
+        slow.immortal.insert(200);
+        let action = restart_action();
+        let record = &execute(&slow, std::slice::from_ref(&action), 501)[0];
+        assert_eq!(
+            super::left_quit(&action, record),
+            Some(PathBuf::from("/Applications/ChatGPT.app"))
+        );
+
+        let quick = system(&[200]);
+        let record = &execute(&quick, std::slice::from_ref(&action), 501)[0];
+        assert_eq!(super::left_quit(&action, record), None);
+
+        let relaunched = super::relaunch(&quick, Path::new("/Applications/ChatGPT.app"));
+        assert_eq!(relaunched.outcome, Outcome::Restarted);
+        assert_eq!(relaunched.target, "ChatGPT");
     }
 
     #[test]
