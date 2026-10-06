@@ -1,6 +1,7 @@
 # agentwarden: specification
 
-Status: definition, accepted for research gates. Date: 2026-10-06.
+Status: definition; research gates R1–R4 closed, R5 estimated (see
+[research](research.md)). Date: 2026-10-06.
 No product code exists yet; the `stats` example from the template is still in
 place.
 
@@ -134,19 +135,22 @@ application, and refusal.
 | Footprint, not RSS, as the cost metric | RSS hides swapped memory, measured above |
 | Configurable MCP servers are routed through an existing multiplexer, not reimplemented | mcp-mux already handles sharing modes and idle shutdown |
 | `unsafe_code = "forbid"` stays | Native calls come through a maintained crate or a system command |
+| Footprint is read with the `libproc` crate (`proc_pid_rusage`) | Reads all same-user processes without root in under 1 ms; `sysinfo` reports RSS (R4) |
+| Idle MCP servers under a live parent are reclaimed only for Claude Code sessions, never for loaded Codex threads | Claude Code restarts a stopped server on the next call; Codex reports it "not connected" until an MCP refresh (R1) |
+| Codex attribution stops at the app; pools are grouped by start time and labelled inferred | Codex MCP children carry no thread identity and the desktop app-server is not reachable from outside (R2) |
+| Build admission is a FIFO jobserver exported as `CARGO_MAKEFLAGS`, refilled to N when no holder is alive | Measured peak 4 instead of 22 rustc with 2 tokens; tokens of a killed build are lost; system make 3.81 cannot read FIFO jobservers (R3) |
 
 ## Research gates
 
-Each gate must close with recorded evidence before the dependent capability is
-built.
+Evidence and method for each gate are in [research](research.md).
 
-| Gate | Question | Blocks |
+| Gate | Question | Result |
 | --- | --- | --- |
-| R1 | When an idle session's MCP server is stopped, does Codex or Claude restart it on the next tool call, fail that tool for the session, or fail the session? Per app and per server kind (configured stdio, app-bundled) | Live-parent reclamation |
-| R2 | Can session ownership be observed for Codex app-server children (process tree, `~/.codex` state, app-server protocol)? Without it, ownership stops at the app | Per-session attribution and idle detection for Codex |
-| R3 | Does a machine-wide FIFO jobserver (`--jobserver-auth=fifo:PATH` in `MAKEFLAGS`/`CARGO_MAKEFLAGS`) bound `cargo` and `rustc` parallelism across independent invocations? How are tokens recovered after a crash, and how does the environment reach agent-spawned shells? | Build admission |
-| R4 | Which crate or system interface reads `phys_footprint` for same-user processes without root and without `unsafe` in this crate (`libproc` crate, `sysinfo`, `/usr/bin/footprint`)? What does it cost per scan of ~1,000 processes? | Footprint metric |
-| R5 | Does running configured servers (codegraph, railway, gopls) through mcp-mux remove their duplicates under both apps, and which of them need per-project isolation? | Advice in `status`, scope of R1 |
+| R1 | What happens when an idle session's MCP server is stopped? | Closed. Claude Code 2.1.286 restarts it on the next tool call (run twice). Codex 0.160.0 fails calls with "not connected" until an MCP refresh (source) |
+| R2 | Can Codex MCP children be attributed to threads? | Closed: not from outside the app. No thread marker in the process or its environment; the desktop app-server speaks stdio to the app |
+| R3 | Does a machine-wide FIFO jobserver bound concurrent builds? | Closed: yes, through `CARGO_MAKEFLAGS`. Tokens of a killed build are lost and must be refilled. Delivery of the variable to agent shells is checked at stage 5 |
+| R4 | How to read true memory without root or `unsafe`? | Closed: `proc_pid_rusage` via the `libproc` crate, 0.8 ms for 541 processes |
+| R5 | Does a multiplexer remove duplicate configurable servers? | Estimated, not run: 50 → 28 processes in the current table when keyed by cwd. Installing mcp-mux is the owner's decision |
 
 ## Delivery stages
 
@@ -156,8 +160,10 @@ built.
 2. **Reclaim orphans.** `reclaim` with orphan rules and the safety contract;
    parity with existing tools.
 3. **Watch.** `watch` as a LaunchAgent with interval and swap-pressure triggers.
-4. **Live-parent rules.** Only the rule classes R1 proved safe.
-5. **Build admission.** `builds` after an R3 prototype shows bounded parallelism.
+4. **Live-parent rules.** Idle, stateless servers of Claude Code sessions;
+   never servers of loaded Codex threads.
+5. **Build admission.** `builds` owns the FIFO pool and its refill; the stage
+   starts by verifying that `CARGO_MAKEFLAGS` reaches agent-spawned shells.
 6. **Disk.** `disk` for worktree caches.
 
 ## Completion evidence
@@ -172,6 +178,7 @@ built.
 
 ## Open questions for the owner
 
-- Thresholds for automatic action in `watch` (swap level, idle age) once R1
-  closes; defaults will be proposed from the stage 1 data.
+- Thresholds for automatic action in `watch` (swap level, idle age); defaults
+  will be proposed from the stage 1 data.
+- Whether to install mcp-mux, a third-party binary, to run R5 live.
 - Whether `disk` may ever delete a worktree checkout, or only its `target/`.
