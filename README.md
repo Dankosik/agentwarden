@@ -34,9 +34,9 @@ Then check it:
 
 ```console
 $ agentwarden status
-memory: normal pressure (kernel normal), swap 5.74 GB of 7.00 GB, user idle 0 min
-claude code: 17 sessions, helpers 1.02 GB, idle over 60 min: 9
-codex: app 18701, helpers 0.01 GB in 1 processes, idle 55 min
+memory: normal pressure (kernel normal), swap 6.88 GB of 7.50 GB, user idle 0 min
+claude code: 8 sessions, helpers 0.64 GB, idle over 60 min: 0
+codex: app 85686, holds 6.15 GB, helpers 4.88 GB in 112 processes, running commands 0, idle 0 min
 orphans: 0, 0.00 GB
 planned: nothing to do
 recent:
@@ -78,9 +78,9 @@ long the user has been away. Then it applies four rules:
 
 | Rule | Stops | When |
 | --- | --- | --- |
-| `orphan` | A helper whose agent session has exited (PPID 1), with its descendants | Always, once the helper is 2 minutes old |
-| `idle-claude-session` | The MCP servers of a Claude Code session that has done nothing | Idle 60 min under warning pressure, 15 min under critical; never under normal pressure |
-| `idle-codex-restart` | The ChatGPT app that hosts Codex, quit and relaunched in the background | Codex idle 30 min, user away 30 min, Codex helpers ≥ 1 GB or warning pressure, at most once per 6 hours |
+| `orphan` | A helper whose agent session has exited (PPID 1), with its descendants | Always, once the helper is 2 minutes old; it must have been seen serving an agent, or match a configured MCP server by a specific program and arguments |
+| `idle-claude-session` | The MCP servers of a Claude Code session that has done nothing: no CPU beyond its timers, no new process, no running shell | Idle 60 min under warning pressure, 15 min under critical; never under normal pressure; the clock restarts after the Mac sleeps |
+| `idle-codex-restart` | The ChatGPT app that hosts Codex, quit and relaunched in the background | No Codex session write for 30 min and no command running under the app however long, user away 30 min, Codex holds ≥ 1 GB (≥ 512 MB under pressure), at most once per 6 hours |
 | Codex helpers one by one | Never | Codex reports a stopped server as "not connected" until it refreshes |
 
 Why these are safe: Claude Code starts a stopped MCP server again on the next
@@ -93,7 +93,10 @@ Safety rules:
 - A process is signalled only after its PID and start time are checked again,
   so a reused PID is never hit.
 - Only the current user's processes, never one with a terminal, never a
-  launchd service, never an agent itself.
+  shell, never a launchd service, never an agent itself, and nothing whose
+  tree contains one of those. It refuses to run as root.
+- When a system command fails or prints something it cannot read, the pass
+  stops instead of acting on a partial picture.
 - Children stop before parents: SIGTERM, then SIGKILL after 5 seconds.
 - The app is only asked to quit; if it has not quit within 60 seconds, the
   restart is abandoned and recorded, never forced.
@@ -114,11 +117,11 @@ Safety rules:
 | --- | --- |
 | `version` | agentwarden version |
 | `taken_at` | Unix time of the sample |
-| `pressure`, `kernel_pressure` | `normal`, `warning`, `critical`; `pressure` is the kernel level raised by swap trends, which the rules use |
+| `pressure`, `kernel_pressure` | `normal`, `warning`, `critical`; `pressure` is the kernel level raised to `warning` while swap grows, which the rules use |
 | `swap` | `used_bytes`, `total_bytes` |
 | `user_idle_secs` | Seconds since keyboard or pointer input |
 | `claude_sessions[]` | `pid`, `idle_secs` (null until sampled twice), `helpers_footprint_bytes`, `helpers[]` |
-| `codex` | `app_pid`, `idle_secs`, `pools_footprint_bytes`, `pools[]`; null when the app is not running |
+| `codex` | `app_pid`, `idle_secs`, `footprint_bytes` (what a restart reclaims), `pools_footprint_bytes`, `pools[]`, `commands[]` (running work that blocks a restart); null when the app is not running |
 | `orphans[]` | `pid`, `exe_name`, `footprint_bytes` (with descendants), `age_secs` |
 | `planned[]` | Actions the rules choose now: `kind` `stop` or `restart-codex`, `rule`, targets, `footprint_bytes`, `reason` |
 | `applied[]` | What this run did: `outcome` `stopped`, `skipped`, `failed`, `restarted` or `refused` |

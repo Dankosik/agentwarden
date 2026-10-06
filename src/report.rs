@@ -1,6 +1,6 @@
 //! One pass of agentwarden and the report it prints.
 
-use std::fmt::Write as _;
+use std::{fmt::Write as _, io, io::Write as _};
 
 use serde::Serialize;
 
@@ -51,8 +51,12 @@ pub struct SessionReport {
 pub struct CodexReport {
     pub app_pid: i32,
     pub idle_secs: u64,
+    /// Codex runtimes with everything under them; what a restart reclaims.
+    pub footprint_bytes: u64,
     pub pools_footprint_bytes: u64,
     pub pools: Vec<HelperReport>,
+    /// Running shells and commands; while any runs, Codex is not restarted.
+    pub commands: Vec<HelperReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,8 +97,11 @@ pub fn pass(system: &dyn System, store: &Store, apply: bool) -> Result<Report, A
         state.last_codex_restart_at = Some(snapshot.taken_at);
     }
     state.observe(&snapshot, &ownership);
-    store.append(&applied).map_err(AppError::Store)?;
+    // State first: it holds the restart gate, and the log only reports.
     store.save_state(&state).map_err(AppError::Store)?;
+    if let Err(error) = store.append(&applied) {
+        let _ = writeln!(io::stderr(), "cannot append to the action log: {error}");
+    }
     Ok(Report {
         applied,
         recent: store.recent(RECENT_RECORDS),
@@ -136,13 +143,18 @@ fn build(
         let pools: Vec<HelperReport> = app.pools.iter().filter_map(helper).collect();
         let idle_secs = snapshot
             .codex_activity_at
-            .map_or(process.age_secs, |at| snapshot.taken_at.saturating_sub(at))
-            .min(app.youngest_activity_secs.unwrap_or(u64::MAX));
+            .map_or(process.age_secs, |at| snapshot.taken_at.saturating_sub(at));
         Some(CodexReport {
             app_pid: app.pid,
             idle_secs,
+            footprint_bytes: app
+                .runtimes
+                .iter()
+                .map(|runtime| ownership.tree_footprint(*runtime))
+                .sum(),
             pools_footprint_bytes: pools.iter().map(|h| h.footprint_bytes).sum(),
             pools,
+            commands: app.commands.iter().filter_map(helper).collect(),
         })
     });
     Report {
@@ -207,10 +219,12 @@ pub fn text(report: &Report) -> String {
         Some(codex) => {
             let _ = writeln!(
                 out,
-                "codex: app {}, helpers {} in {} processes, idle {} min",
+                "codex: app {}, holds {}, helpers {} in {} processes, running commands {}, idle {} min",
                 codex.app_pid,
+                gb(codex.footprint_bytes),
                 gb(codex.pools_footprint_bytes),
                 codex.pools.len(),
+                codex.commands.len(),
                 minutes(codex.idle_secs)
             );
         }

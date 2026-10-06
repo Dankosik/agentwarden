@@ -7,26 +7,33 @@ use serde::Deserialize;
 
 use crate::model::{Pressure, ServerSignature, Swap};
 
-/// Fields from `ps -axww -o pid=,ppid=,uid=,tty=,time=,etime=,lstart=`.
+/// Fields from `ps -axww -o pid=,ppid=,uid=,tty=,state=,time=,etime=,lstart=`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PsRow {
     pub pid: i32,
     pub ppid: i32,
     pub uid: u32,
     pub has_tty: bool,
+    /// Exited but not yet reaped; signals cannot reach it.
+    pub zombie: bool,
     pub cpu_centis: u64,
     pub age_secs: u64,
     pub started: String,
 }
 
-pub fn ps_rows(text: &str) -> Vec<PsRow> {
-    text.lines().filter_map(ps_row).collect()
+/// The process table, or `None` when it does not read as the C-locale format:
+/// an empty or mostly unparsed table must not pass for a machine with no
+/// agents.
+pub fn ps_rows(text: &str) -> Option<Vec<PsRow>> {
+    let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+    let rows: Vec<PsRow> = text.lines().filter_map(ps_row).collect();
+    (!rows.is_empty() && rows.len() * 10 >= lines * 9).then_some(rows)
 }
 
 fn ps_row(line: &str) -> Option<PsRow> {
     let fields: Vec<&str> = line.split_whitespace().collect();
-    // pid ppid uid tty time etime + five lstart words (Day Mon DD HH:MM:SS YYYY).
-    let [pid, ppid, uid, tty, time, etime, rest @ ..] = fields.as_slice() else {
+    // pid ppid uid tty state time etime + five lstart words (Day Mon DD HH:MM:SS YYYY).
+    let [pid, ppid, uid, tty, state, time, etime, rest @ ..] = fields.as_slice() else {
         return None;
     };
     if rest.len() != 5 {
@@ -37,6 +44,7 @@ fn ps_row(line: &str) -> Option<PsRow> {
         ppid: ppid.parse().ok()?,
         uid: uid.parse().ok()?,
         has_tty: !tty.starts_with('?'),
+        zombie: state.starts_with('Z'),
         cpu_centis: clock_centis(time)?,
         age_secs: clock_centis(etime)? / 100,
         started: rest.join(" "),
@@ -206,13 +214,14 @@ mod tests {
     #[test]
     fn ps_rows_parse_cpu_age_tty_and_start() {
         let text = "\
-    1     0     0 ??        37:14.55    4-03:10:30 Fri Oct  2 18:15:22 2026
- 9161  9160   501 ??         1:02:03.4     02:34:55 Tue Oct  6 12:37:26 2026
- 9200  9161   501 ttys001    0:00.01        00:05 Tue Oct  6 15:12:20 2026
-garbage line
+    1     0     0 ??       Ss   37:14.55    4-03:10:30 Fri Oct  2 18:15:22 2026
+ 9161  9160   501 ??       S     1:02:03.4     02:34:55 Tue Oct  6 12:37:26 2026
+ 9200  9161   501 ttys001  S+    0:00.01        00:05 Tue Oct  6 15:12:20 2026
+ 9300  9161   501 ??       Z     0:00.00        00:05 Tue Oct  6 15:12:20 2026
 ";
-        let rows = ps_rows(text);
-        assert_eq!(rows.len(), 3);
+        let rows = ps_rows(text).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows[3].zombie && !rows[1].zombie);
         assert_eq!(rows[0].cpu_centis, (37 * 60 + 14) * 100 + 55);
         assert_eq!(rows[0].age_secs, 4 * 86_400 + 3 * 3600 + 10 * 60 + 30);
         assert_eq!(rows[0].started, "Fri Oct 2 18:15:22 2026");
@@ -220,6 +229,15 @@ garbage line
         assert_eq!(rows[1].cpu_centis, (3600 + 2 * 60 + 3) * 100 + 40);
         assert!(rows[2].has_tty);
         assert_eq!(rows[2].age_secs, 5);
+    }
+
+    #[test]
+    fn foreign_locale_table_is_refused_not_read_as_empty() {
+        // `ps` under LANG=ru_RU prints lstart as seven words.
+        let russian =
+            " 9161  9160   501 ??  S  1:02.03  02:34:55 вторник,  6 октября 2026 г. 17:14:13\n";
+        assert_eq!(ps_rows(russian), None);
+        assert_eq!(ps_rows(""), None);
     }
 
     #[test]

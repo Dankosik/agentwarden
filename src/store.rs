@@ -113,8 +113,13 @@ impl Store {
             Err(error) => return Err(error),
         };
         let mut lines = std::collections::VecDeque::new();
-        for line in BufReader::new(file).lines() {
-            lines.push_back(line?);
+        let mut reader = BufReader::new(file);
+        let mut buffer = Vec::new();
+        // A line torn by a crash may not be UTF-8; it must not hide the rest.
+        while reader.read_until(b'\n', &mut buffer)? > 0 {
+            let line = String::from_utf8_lossy(&buffer);
+            lines.push_back(line.trim_end_matches(['\n', '\r']).to_owned());
+            buffer.clear();
             if lines.len() > count {
                 lines.pop_front();
             }
@@ -187,5 +192,26 @@ mod tests {
         assert_eq!(all.last().unwrap().at, 9999);
         store.append(&[record(7000)]).unwrap();
         assert_eq!(store.recent(1)[0].at, 7000);
+    }
+
+    #[test]
+    fn a_torn_log_line_does_not_hide_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store.append(&[record(1)]).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.log_path())
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"{\"at\":\xff\xfe\n").unwrap();
+        store.append(&[record(2)]).unwrap();
+        let at: Vec<u64> = store.recent(10).iter().map(|r| r.at).collect();
+        assert_eq!(at, [1, 2]);
+    }
+
+    #[test]
+    fn state_from_an_older_version_keeps_what_it_has() {
+        let state: State = serde_json::from_str(r#"{"last_codex_restart_at": 5}"#).unwrap();
+        assert_eq!(state.last_codex_restart_at, Some(5));
     }
 }

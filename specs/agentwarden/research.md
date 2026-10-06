@@ -202,3 +202,35 @@ and no `codex exec` started, so the activity signal stayed quiet, and the
 hidden-thread pools of
 [openai/codex#43971](https://github.com/openai/codex/issues/43971) did not
 appear in this version.
+
+## Independent review after 0.1.0 (2026-10-06)
+
+Four read-only reviewers (process safety, rules and state, platform probes,
+distribution) and the live action log. Confirmed on the owner's machine:
+
+- `zsh -lc 'sleep 3'` leaves no shell: the command is the parent's direct
+  child. Codex runs commands this way, so 0.1.0 counted a running command
+  under the app-server as an MCP pool and not as activity.
+- With kernel pressure at warning and Codex pools at 10 MB, only the user's
+  presence kept 0.1.0 from restarting the app.
+- Allocated swap sat at 85–92 % for hours (4.51 of 5.00 GB, 6.88 of 7.50 GB)
+  while the kernel said normal or warning; 0.1.0 read ≥ 90 % as critical, and
+  its 13:39 stops used the 15-minute window.
+- The system locale is `ru_RU`: `ps` prints `lstart` in seven Russian words, and
+  0.1.0 `status` under that `LANG` showed no sessions and no swap.
+- Passes are 64–66 s apart, so 0.1.0's rounding doubled the idle CPU
+  tolerance.
+- The live Codex tree holds 112 helpers (configured servers and helpers
+  bundled in `ChatGPT.app`) and a permanent `codex exec-server`; 0.1.1
+  classifies all of them as pools or runtimes and none as commands.
+- The owner's `caffeinate` holds `PreventUserIdleDisplaySleep` for days, so a
+  power assertion cannot serve as a presence signal here.
+- In the first day, 34 actions stopped 4.3 GB with no failures and no repeated
+  stop of a respawned server; the watcher used 1.4 MB and about 1 % of a core,
+  most of it `top`.
+
+0.1.1 fixes the defects that could stop work in progress or misread the
+machine. Left for a later release: helper CPU as a sign of an in-flight MCP
+call, relaunching an app that quit after the 60-second wait, release
+attestations and immutable releases, and serving `install.sh` from the
+release.
