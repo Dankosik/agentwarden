@@ -1,45 +1,59 @@
 # Releases
 
-The template builds native executable archives for Linux x86_64, macOS Apple
-Silicon, macOS Intel, and Windows x86_64. A `v` tag starts the release workflow.
-It runs the same required CI as a pull request, validates the tag and repository
-against Cargo metadata, builds on each native runner, and tests the executable
-after extracting it from its final archive. A single final job publishes the
-complete set and SHA-256 checksums as a GitHub Release.
+agentwarden ships native archives for macOS on Apple Silicon and Intel. A `v`
+tag starts the release workflow. It runs the same required CI as a pull
+request, validates the tag and repository against Cargo metadata, builds on
+each native runner, and tests the executable after extracting it from its final
+archive. A single final job publishes both archives, `SHA256SUMS`, and the
+tagged version's [changelog](../CHANGELOG.md) section as a GitHub Release.
+[`install.sh`](../install.sh) installs from that release.
 
-To verify the native packaging pipeline before making a release, open the
-**Release** workflow in GitHub Actions and choose **Run workflow** on a branch.
-This runs CI, builds and tests all four native archives at the selected commit,
-and uploads them as workflow artifacts. Branch dispatches do not validate a
-version tag or create a GitHub Release. The publication job runs only for
-`refs/tags/v...`; use a branch when requesting verification without publication.
+To verify packaging before a release, open the **Release** workflow in GitHub
+Actions and choose **Run workflow** on a branch. This runs CI, builds and tests
+both archives at the selected commit, and uploads them as workflow artifacts.
+Branch dispatches do not validate a version tag or create a GitHub Release.
 
 The workflow uses the repository's `GITHUB_TOKEN`; no personal token, crates.io
-credentials, package manager account, or signing service is required. Creating a
-tag is an intentional publication action. Nothing publishes from ordinary
-branch commits, branch dispatches, or pull requests. `publish = false` prevents accidental registry
-publication and does not prevent binary releases.
+credentials, or signing service is required. Creating a tag is an intentional
+publication action. Nothing publishes from branch commits, branch dispatches,
+or pull requests. `publish = false` prevents accidental crates.io publication.
 
-## Before tagging
+## Versions
 
-Initialize the repository's package name and repository URL. Update
-`package.version` in `Cargo.toml` and let Cargo refresh the root package entry in
-`Cargo.lock`. Run the documented validation commands and review compatibility
-changes to arguments, stdout, stderr, exit status, and configuration. Commit
-the release changes, wait for required CI, then create and push the matching
-tag, such as `v0.1.0`. The tag must identify the exact checked-out commit and
-its version must equal Cargo's version.
+Versions follow [Semantic Versioning](https://semver.org/). The public
+interface is the commands and flags, the `--format json` fields, exit codes,
+file locations, and the LaunchAgent label. Before 1.0, a minor version may
+change that interface and its changelog entry says how; a patch version never
+does. A rule change that stops more processes, or stops them sooner, is at
+least a minor version.
 
-The publication step refuses to overwrite an existing release. If a run fails
-before publication, repair the cause and rerun it where appropriate. If a
-release already exists or publication partly succeeded, inspect its assets and
-the run before deciding whether to finish that release or issue a new version.
-Do not move a tag that users may already have downloaded.
+## Making a release
+
+1. Move the `Unreleased` entries in `CHANGELOG.md` under a new
+   `## [X.Y.Z] - YYYY-MM-DD` heading and update the links at the bottom.
+2. Set `package.version` in `Cargo.toml` to `X.Y.Z` and run
+   `cargo check --locked` after `cargo update -p agentwarden` so `Cargo.lock`
+   follows.
+3. Run `make verify` and `python3 scripts/release.py notes` to preview the
+   release page. Merge through a pull request with required CI green.
+4. Tag the merge commit on `main` and push the tag:
+   `git tag vX.Y.Z && git push origin vX.Y.Z`. A tag with a suffix, such as
+   `v0.2.0-rc.1`, publishes a prerelease that `install.sh` does not pick as
+   the latest.
+5. After the release is published, run `install.sh` on a Mac and confirm
+   `agentwarden status --format json` reports the new `version`.
+
+The tag must identify the exact checked-out commit and its version must equal
+Cargo's version. The publication step refuses to overwrite an existing release.
+If a run fails before publication, repair the cause and rerun it. If a release
+already exists or publication partly succeeded, inspect its assets and the run
+before deciding whether to finish that release or issue a new version. Do not
+move a tag that users may already have downloaded.
 
 ## Local packaging
 
-Rust and Python 3.9+ are sufficient for packaging on a supported host. Replace
-the target below with the `host` reported by `rustc -vV`:
+On a Mac with Rust and Python 3.9+, replace the target below with the `host`
+reported by `rustc -vV`:
 
 ```sh
 cargo build --release --locked --target aarch64-apple-darwin
@@ -48,38 +62,30 @@ python3 scripts/release.py package --target aarch64-apple-darwin --dist dist
 
 Packaging derives the binary name and version from `cargo metadata`. It
 includes the binary, `README.md`, and `LICENSE`, plus `NOTICE`,
-`THIRD_PARTY_NOTICES`, and `THIRD_PARTY_NOTICES.md` when present. Keep required dependency notices current
-when changing the distribution's dependencies. The smoke test runs
-`--version` and `completions bash`, which need no system access and so run on
-every packaged target; the commands that read processes are macOS-only.
-
+`THIRD_PARTY_NOTICES`, and `THIRD_PARTY_NOTICES.md` when present. The smoke
+test runs `--version` and `completions bash`, which need no system access.
 Packaging never cross-compiles or claims to test a foreign executable.
-`checksums` validates the full four-target inventory before writing
-`SHA256SUMS`; individual local packages do not satisfy that release inventory.
+`checksums` validates the full inventory before writing `SHA256SUMS`.
 
 ## Supported artifacts
 
 | Target | Build runner | Archive |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` | Ubuntu 22.04 x86_64 | `.tar.gz` |
 | `aarch64-apple-darwin` | macOS 15 Apple Silicon | `.tar.gz` |
 | `x86_64-apple-darwin` | macOS 15 Intel | `.tar.gz` |
-| `x86_64-pc-windows-msvc` | Windows 2025 x86_64 | `.zip` |
 
-Linux output dynamically links the GNU C runtime and requires glibc 2.35 or
-newer with the default build. It is not a musl/static build. The initial macOS
-compatibility claim is the native runner version, macOS 15; test any older
-deployment target before promising it. macOS binaries are not signed or
-notarized, and Windows binaries are not Authenticode signed. Owners can add
-signing when their distribution requirements and credentials are known.
+Linux and Windows build and pass CI, but agentwarden refuses to run there, so
+no archives are published for them. The binaries are not signed or notarized.
+`install.sh` downloads with `curl`, which does not mark files as quarantined,
+so Gatekeeper does not block them; an archive downloaded with a browser needs
+`xattr -d com.apple.quarantine agentwarden` before its first run.
 
-Verify a downloaded archive before extracting it. On Linux, run
-`sha256sum --check --ignore-missing SHA256SUMS`; on macOS, run
-`shasum -a 256 --check --ignore-missing SHA256SUMS`. On Windows, compare
-`Get-FileHash -Algorithm SHA256 <archive.zip>` with the matching checksum line.
-Checksums detect download corruption; they are not an independent publisher
-signature. The initial workflow does not claim signed provenance.
+Verify a manually downloaded archive with
+`shasum -a 256 --check --ignore-missing SHA256SUMS`; `install.sh` does this
+itself. Checksums detect download corruption; they are not an independent
+publisher signature.
 
 When changing a target, update the release workflow matrix, `TARGETS` in
-`scripts/release.py`, this table, and the corresponding verification evidence.
-Keep the aggregate `required` CI check as the branch protection target.
+`scripts/release.py`, `install.sh`, this table, and the corresponding
+verification evidence. Keep the aggregate `required` CI check as the branch
+protection target.

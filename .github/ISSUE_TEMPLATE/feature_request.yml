@@ -1,15 +1,15 @@
 name: Feature request
-description: Describe a concrete command-line use case.
+description: A helper, agent, or situation agentwarden should handle.
 body:
   - type: textarea
     id: outcome
     attributes:
       label: Desired outcome
-      description: What should a user be able to do? Include an example invocation or workflow.
+      description: Which processes hold memory, which agent starts them, and when they are safe to stop.
     validations:
       required: true
   - type: textarea
     id: constraints
     attributes:
-      label: Constraints and alternatives
-      description: Note relevant input size, platforms, compatibility, memory or time budgets, and current workarounds.
+      label: Evidence and constraints
+      description: Footprint numbers, how the agent behaves after the helper stops, and current workarounds.

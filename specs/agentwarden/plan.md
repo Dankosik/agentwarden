@@ -107,3 +107,4 @@ As of 2026-10-06, branch `feat/agentwarden`:
 | T14 | Done | 65 idle minutes: no session writes, no shell or `codex exec`; the activity signal stays quiet ([research](research.md)) |
 | T15 | Done | SIGTERM quit in under 1 s, no prompt; background relaunch; Codex threads intact ([research](research.md)) |
 | T17 | Pending | Happens when the conditions first hold; read the action log |
+| Distribution | Done in `feat/distribution` | `install.sh` from GitHub Releases with checksum check; macOS-only release archives; `CHANGELOG.md` as release notes; `version` in the JSON report; a repeated `install` restarts the agent |

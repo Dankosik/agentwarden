@@ -26,6 +26,8 @@ contract; this file owns where each responsibility lives.
 | `src/output.rs` | Text or JSON on stdout, and output-write failures |
 | `src/error.rs` | Error types and diagnostic rendering |
 | `tests/cli.rs` | The built binary: grammar, status, framing |
+| `install.sh` | Install or upgrade from GitHub Releases: architecture, checksum, binary, then `agentwarden install` |
+| `scripts/release.py` | Release archives, checksums, and release notes from `CHANGELOG.md` |
 
 ## Data flow
 

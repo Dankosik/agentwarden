@@ -22,14 +22,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
           - os: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     defaults:
@@ -98,10 +94,11 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Validate source and complete artifact set
+      - name: Validate source, complete artifact set, and notes
         run: |
           python scripts/release.py check-tag --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
           python scripts/release.py checksums --dist dist
+          python scripts/release.py notes > "$RUNNER_TEMP/notes.md"
       - name: Create release with every archive and checksum
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,4 +107,5 @@ jobs:
           if [[ "$RELEASE_TAG" == *-* ]]; then
             extra+=(--prerelease)
           fi
-          gh release create "$RELEASE_TAG" dist/* --repo "$RELEASE_REPOSITORY" --verify-tag --generate-notes "${extra[@]}"
+          gh release create "$RELEASE_TAG" dist/* --repo "$RELEASE_REPOSITORY" --verify-tag \
+            --title "agentwarden $RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.md" "${extra[@]}"

@@ -1,25 +1,23 @@
 name: Bug report
-description: Report a reproducible CLI or template defect.
+description: agentwarden stopped something it should not have, missed something, or failed.
 body:
-  - type: textarea
-    id: command
-    attributes:
-      label: Command and input
-      description: Include a minimal reproducible command and safe sample input. Remove secrets and private file contents.
-      render: shell
-    validations:
-      required: true
   - type: textarea
     id: behavior
     attributes:
-      label: Expected and actual behavior
-      description: Include stdout, stderr, and exit status when relevant.
+      label: What happened and what you expected
+      description: Include the command, its output, and exit status. For an unexpected stop, include the matching lines of ~/Library/Application Support/agentwarden/actions.jsonl.
     validations:
       required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: agentwarden status
+      description: Output of `agentwarden status`. It lists executable names and PIDs, not command lines; remove anything private.
+      render: text
   - type: input
     id: version
     attributes:
-      label: Version and environment
-      description: CLI version or commit, operating system, architecture, and Rust version if building from source.
+      label: Versions
+      description: agentwarden --version, macOS version, Apple Silicon or Intel, Claude Code and Codex versions.
     validations:
       required: true

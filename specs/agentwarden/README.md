@@ -166,7 +166,7 @@ grammar.
 
 | Command | Effect | Writes |
 | --- | --- | --- |
-| `agentwarden install` | Installs and starts the per-user LaunchAgent that runs `watch`; repeat runs are no-ops; `--uninstall` removes it | LaunchAgent plist |
+| `agentwarden install` | Installs and starts the per-user LaunchAgent that runs `watch`; a repeat run restarts it on the binary it is run from, so an upgrade takes effect; `--uninstall` removes it | LaunchAgent plist |
 | `agentwarden watch` | The loop the LaunchAgent runs: every 60 s, sample, apply rules, log | Signals, log |
 | `agentwarden status` | Owners, footprint, age, idleness, pressure level, recent actions; `--format json` for agents | Nothing |
 | `agentwarden reclaim` | One pass of the rules now; `--dry-run` prints the plan only | Signals, log |
@@ -178,8 +178,9 @@ actions are outcomes in the log, not failures.
 ### Agent-first interface
 
 - The repository's README starts with the one command an agent runs to install
-  and verify: build or download, then `agentwarden install`, then
-  `agentwarden status --format json`.
+  or upgrade: `install.sh` downloads the release for the Mac's architecture,
+  verifies its checksum, and runs `agentwarden install`; then
+  `agentwarden status --format json`, whose `version` field shows what runs.
 - `status --format json` has a stable schema, documented in the README: pressure level, owner tree
   with footprint, idle durations, and the last actions with their rule and
   recovered memory.
