@@ -115,13 +115,38 @@ process passes the [safety contract](#safety-contract).
 | --- | --- | --- | --- |
 | Orphan | A helper process whose agent parent has exited (PPID 1, or a recycled parent PID) and whose command line belongs to an agent tool's helper | Older than a short grace period | No session can use it again |
 | Idle Claude session | Every MCP server child of a Claude Code session whose own CPU time has not grown for the idle window | Idle window chosen by pressure (below) | Claude Code restarts a stopped server on the next tool call (R1, observed twice) |
-| Codex leak | Codex app-server MCP children | Never stopped | Codex reports a stopped server as "not connected" in that thread (R1); see [open question](#open-questions-for-the-owner) |
+| Codex leak | Codex app-server MCP children | Never stopped one by one | Codex reports a stopped server as "not connected" in that thread (R1) |
+| Idle Codex restart | The ChatGPT app that hosts Codex, restarted as a whole | All [conditions](#idle-codex-restart) hold | Saved threads persist on disk; restarting frees every pool the app leaked (swap 23.3 → 5.1 GB observed) |
 
 **Idle is measured on the session, not on the server.** Some servers spend CPU
 on their own work, such as watching files, while no one calls them. A session
 that has run no turn is idle whatever its servers do. A REPL-style server
 (state kept in its process) loses that state when an idle session's servers are
 stopped; the session gets a fresh one on its next call.
+
+### Idle Codex restart
+
+Owner decision 2026-10-06: agentwarden restarts the app when Codex is idle,
+because the Codex leak cannot be reclaimed in place. Defaults are fixed in
+code:
+
+| Condition | Default | Signal (no root needed, checked on the owner's machine) |
+| --- | --- | --- |
+| No Codex turn activity | 30 minutes | No `~/.codex/sessions/**/rollout-*.jsonl` modified, and no process started under the Codex app-server except MCP pool members |
+| Nobody at the machine | 30 minutes | HID idle time from `IOHIDSystem` |
+| Worth restarting | Codex helpers' footprint ≥ 1 GB, or pressure Warning or Critical | Footprint (R4), pressure level |
+| Not too often | At most once per 6 hours | Action log |
+
+Restart sequence: ask the app to quit gracefully; if it has not exited within
+60 seconds, abort and record the refusal (never force-kill the app); relaunch
+it in the background without focus; the next pass reclaims helpers the quit
+left orphaned.
+
+MCP pool members are processes whose command line matches an MCP server in
+Codex's own configuration (`~/.codex/config.toml`) or one of Codex's bundled
+helpers. Pools that Codex starts by itself while idle
+([openai/codex#43971](https://github.com/openai/codex/issues/43971)) therefore
+do not count as activity.
 
 ### Pressure levels
 
@@ -164,9 +189,10 @@ refusal.
 
 - Before a signal, the PID is revalidated by start time and command line; a
   changed process is skipped.
-- Only the current user's processes are signalled. System processes, the agent
-  applications themselves, terminals, editors, and any process with a TTY are
-  never signalled.
+- Only the current user's processes are signalled. System processes,
+  terminals, editors, and any process with a TTY are never signalled. The
+  agent applications are never signalled either; the only exception is the
+  graceful quit in [idle Codex restart](#idle-codex-restart).
 - Stopping is SIGTERM, then SIGKILL after a grace period, applied to the
   server's process group when it owns one.
 - Every stop appends one structured record to the action log.
@@ -183,7 +209,7 @@ refusal.
 | `unsafe_code = "forbid"` stays | Native calls come through a maintained crate or a system command |
 | Idleness is a session property, not a server property | Rules stay tool- and language-neutral; a server can be busy with its own work while unused |
 | Claude Code session servers may be stopped when the session is idle | Claude Code restarts a stopped server on the next call (R1) |
-| Codex app-server children are never stopped | Codex reports a stopped server "not connected" until an MCP refresh (R1); threads are not observable from outside (R2) |
+| Codex app-server children are never stopped one by one; the whole app is restarted when Codex and the user are idle | Codex reports a stopped server "not connected" until an MCP refresh (R1); threads are not observable from outside (R2); owner chose restart over report-only |
 | No build admission, no cache reclamation | Owner decision; see [Out of scope](#out-of-scope) |
 
 ## Research gates
@@ -204,6 +230,11 @@ Remaining checks belong to implementation, not to new gates:
   grown" tolerance.
 - Confirm on each stage that the Claude Code version in use still restarts
   stopped servers; a release that stops doing so disables the idle rule.
+- Observe an idle Codex for one hour: which rollout writes and processes
+  appear, to confirm the activity signal does not fire on its own.
+- Find a graceful quit that needs no one-time permission prompt (AppleScript
+  `quit` triggers macOS Automation consent; SIGTERM to the app is the
+  candidate) and confirm threads are listed again after relaunch.
 
 ## Delivery stages
 
@@ -213,6 +244,7 @@ Remaining checks belong to implementation, not to new gates:
 3. **Install and watch.** `install` and the LaunchAgent loop with pressure
    levels.
 4. **Idle Claude sessions.** The idle-session rule.
+5. **Idle Codex restart.** The restart rule and its sequence.
 
 ## Completion evidence
 
@@ -224,11 +256,13 @@ Remaining checks belong to implementation, not to new gates:
   day without it.
 - Stage 4: an idle session's next tool call succeeds after its servers were
   stopped.
+- Stage 5: one recorded restart on the owner's machine: conditions met, app
+  quit gracefully and relaunched, Codex threads still listed, helpers and swap
+  before and after.
 
-## Open questions for the owner
+## Resolved owner decisions
 
-- **Codex leak.** Codex holds most of the leaked memory and cannot be fixed
-  safely in place. Options: (a) only report it in `status`; (b) restart the
-  Codex app automatically when its whole process tree has been idle for a long
-  period, for example overnight. Saved threads survive a restart, but an open
-  window closes. The default is (a) until the owner chooses.
+- 2026-10-06: the Codex leak is handled by [idle Codex restart](#idle-codex-restart)
+  rather than report-only, with the defaults above.
+
+Plan: [plan](plan.md).
