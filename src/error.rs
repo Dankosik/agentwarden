@@ -7,16 +7,19 @@ pub(crate) enum AppError {
     Unsupported,
     #[error("HOME is not set")]
     NoHome,
+    #[cfg(target_os = "macos")]
     #[error("cannot run {program}: {source}")]
     Command {
         program: String,
         #[source]
         source: io::Error,
     },
+    #[cfg(target_os = "macos")]
     #[error("{program} failed: {status}")]
     CommandFailed { program: String, status: String },
     #[error("cannot write agentwarden state or log: {0}")]
     Store(#[source] io::Error),
+    #[cfg(target_os = "macos")]
     #[error("cannot install the LaunchAgent: {0}")]
     Install(#[source] io::Error),
     #[error("cannot encode JSON: {0}")]

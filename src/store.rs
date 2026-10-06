@@ -83,10 +83,14 @@ impl Store {
             serde_json::to_writer(&mut lines, record).map_err(io::Error::other)?;
             lines.push(b'\n');
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        file.write_all(&lines)?;
-        file.flush()?;
-        if file.metadata()?.len() > LOG_MAX_BYTES {
+        let size = {
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+            file.write_all(&lines)?;
+            file.flush()?;
+            file.metadata()?.len()
+        };
+        // The handle is closed first: Windows cannot replace an open file.
+        if size > LOG_MAX_BYTES {
             let kept = Self::tail(&path, LOG_KEEP_LINES)?;
             self.replace(&path, kept.join("\n").as_bytes())?;
         }

@@ -3,7 +3,7 @@
 mod actions;
 mod cli;
 mod error;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 mod install;
 mod model;
 mod output;
