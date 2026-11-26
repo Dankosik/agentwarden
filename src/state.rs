@@ -5,10 +5,11 @@ use std::{
     io::{self, Write as _},
 };
 
+use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::{Identity, Pressure, Snapshot},
+    model::{AgentKind, Identity, Pressure, Snapshot},
     owners::Ownership,
 };
 
@@ -31,14 +32,26 @@ pub struct State {
     pub sessions: BTreeMap<String, SessionActivity>,
     pub last_swap_used_bytes: Option<u64>,
     pub last_codex_restart_at: Option<u64>,
-    /// An app a restart asked to quit and that has not been opened again.
+    /// Per-app-bundle restart timestamps (e.g. `"/Users/.../Antigravity US.app"` -> unix secs).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub last_app_restarts: BTreeMap<String, u64>,
+    /// Legacy single pending relaunch (kept for backwards compatibility with existing `state.json`).
     pub pending_relaunch: Option<PendingRelaunch>,
+    /// Additional pending relaunches when more than one app is waiting to reopen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_relaunches: Vec<PendingRelaunch>,
+}
+
+fn default_relaunch_rule() -> CompactString {
+    CompactString::const_new("idle-codex-restart")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRelaunch {
     pub bundle: std::path::PathBuf,
     pub since: u64,
+    #[serde(default = "default_relaunch_rule")]
+    pub rule: CompactString,
 }
 
 /// After this, a still closed app is the user's choice, not agentwarden's.
@@ -96,6 +109,34 @@ impl State {
         })
     }
 
+    /// Last restart timestamp for `bundle` (combining legacy `last_codex_restart_at`
+    /// for Codex desktop apps with per-bundle `last_app_restarts`).
+    pub fn last_restart_at(&self, agent: AgentKind, bundle: &str) -> Option<u64> {
+        let per_bundle = self.last_app_restarts.get(bundle).copied();
+        if agent == AgentKind::Codex {
+            match (self.last_codex_restart_at, per_bundle) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            }
+        } else {
+            per_bundle
+        }
+    }
+
+    /// Record a restart attempt for `bundle`. Returns whether persisted state changed.
+    pub fn record_restart(&mut self, agent: AgentKind, bundle: &str, at: u64) -> bool {
+        let mut changed = false;
+        if agent == AgentKind::Codex && self.last_codex_restart_at != Some(at) {
+            self.last_codex_restart_at = Some(at);
+            changed = true;
+        }
+        if self.last_app_restarts.get(bundle).copied() != Some(at) {
+            self.last_app_restarts.insert(bundle.to_owned(), at);
+            changed = true;
+        }
+        changed
+    }
+
     /// Record this pass. Call after rules were evaluated against the old state.
     /// Returns whether any persisted field changed.
     pub fn observe(&mut self, snapshot: &Snapshot, ownership: &Ownership) -> bool {
@@ -111,19 +152,25 @@ impl State {
         let mut changed = helpers_after_retain != helpers_before
             || self.known_helpers.len() != helpers_after_retain;
 
-        if !self.sessions.is_empty() || !ownership.claude_sessions.is_empty() {
-            if ownership.claude_sessions.is_empty() {
+        let tracked_pids: smallvec::SmallVec<[i32; 8]> = ownership
+            .claude_sessions
+            .iter()
+            .map(|session| session.pid)
+            .collect();
+
+        if !self.sessions.is_empty() || !tracked_pids.is_empty() {
+            if tracked_pids.is_empty() {
                 if !self.sessions.is_empty() {
                     self.sessions.clear();
                     changed = true;
                 }
             } else {
                 // Update existing sessions in place so steady-state passes with
-                // live Claude sessions allocate zero `BTreeMap` nodes.
+                // live sessions allocate zero `BTreeMap` nodes.
                 let prev_len = self.sessions.len();
                 let mut existing_matched = 0usize;
-                for session in &ownership.claude_sessions {
-                    let Some(process) = ownership.process(snapshot, session.pid) else {
+                for &session_pid in &tracked_pids {
+                    let Some(process) = ownership.process(snapshot, session_pid) else {
                         continue;
                     };
                     let mut inserted = None;
@@ -136,7 +183,7 @@ impl State {
                             // when it cost the session itself little CPU.
                             let busy = elapsed > SAMPLE_GAP_SECS
                                 || spent * 60 > IDLE_CPU_CENTIS_PER_MINUTE * elapsed
-                                || ownership.any_descendant(snapshot, session.pid, |child| {
+                                || ownership.any_descendant(snapshot, session_pid, |child| {
                                     child.age_secs <= elapsed
                                 });
                             let next = SessionActivity {
@@ -166,10 +213,10 @@ impl State {
                 }
                 if existing_matched < prev_len {
                     // At least one previously tracked session exited; drop only
-                    // keys that are no longer among live Claude sessions.
+                    // keys that are no longer among live tracked sessions.
                     self.sessions.retain(|key, _| {
-                        ownership.claude_sessions.iter().any(|session| {
-                            ownership.process(snapshot, session.pid).is_some_and(|p| {
+                        tracked_pids.iter().any(|&session_pid| {
+                            ownership.process(snapshot, session_pid).is_some_and(|p| {
                                 with_session_key(p.pid, snapshot.started(p), |k| k == key)
                             })
                         })

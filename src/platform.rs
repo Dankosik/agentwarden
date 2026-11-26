@@ -66,7 +66,7 @@ impl System for NoSystem {
 pub mod macos {
     use std::{
         cell::RefCell,
-        collections::BTreeSet,
+        collections::{BTreeMap, BTreeSet},
         fmt::Write as _,
         fs::{self, File},
         io::{self, Read, Write as _},
@@ -84,7 +84,6 @@ pub mod macos {
         sys::signal::{Signal as NixSignal, kill},
         unistd::{Pid, getuid},
     };
-    use smallvec::SmallVec;
 
     use crate::{
         actions::{Signal, System},
@@ -159,23 +158,345 @@ pub mod macos {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ConfigKind {
+        CodexToml,
+        McpJson,
+        OpencodeJson,
+    }
+
+    struct ExtraConfigEntry {
+        path: PathBuf,
+        kind: ConfigKind,
+        stamp: ConfigStamp,
+        servers: Vec<ServerSignature>,
+    }
+
+    impl ExtraConfigEntry {
+        fn new(path: PathBuf, kind: ConfigKind) -> Self {
+            Self {
+                path,
+                kind,
+                stamp: ConfigStamp::default(),
+                servers: Vec::new(),
+            }
+        }
+
+        fn refresh(&mut self) -> bool {
+            let current = FileStamp::of(&self.path);
+            if self.stamp.is_fresh(current) {
+                return false;
+            }
+            self.servers.clear();
+            let parse: fn(File) -> Vec<ServerSignature> = match self.kind {
+                ConfigKind::CodexToml => probe::codex_servers_from_reader,
+                ConfigKind::McpJson => probe::mcp_json_servers_from_reader,
+                ConfigKind::OpencodeJson => probe::opencode_servers_from_reader,
+            };
+            self.stamp
+                .load_into(&self.path, current, parse, &mut self.servers);
+            true
+        }
+    }
+
     struct McpCache {
         codex: ConfigStamp,
+        codex_servers: Vec<ServerSignature>,
+        codex_projects: Vec<String>,
+        codex_plugins_dir: ConfigStamp,
+        codex_plugin_configs: Vec<PathBuf>,
         claude: ConfigStamp,
+        claude_servers: Vec<ServerSignature>,
+        claude_projects: Vec<String>,
+        claude_plugins: ConfigStamp,
+        plugin_dirs: Vec<String>,
+        gemini_dir: ConfigStamp,
+        gemini_data_dir_configs: Vec<PathBuf>,
+        gemini_plugins_dir: ConfigStamp,
+        gemini_plugin_subdirs: Vec<(PathBuf, Option<FileStamp>)>,
+        gemini_plugin_configs: Vec<(PathBuf, ConfigKind)>,
+        global_extras: Vec<ExtraConfigEntry>,
+        dynamic_extras: Vec<ExtraConfigEntry>,
         combined: Arc<[ServerSignature]>,
         has_distinctive: bool,
+        has_pool_signatures: bool,
         generation: u64,
     }
 
-    impl Default for McpCache {
-        fn default() -> Self {
+    struct GeminiPluginDiscovery {
+        configs: Vec<(PathBuf, ConfigKind)>,
+        subdirs: Vec<(PathBuf, Option<FileStamp>)>,
+    }
+
+    /// Discover MCP config files inside `~/.gemini/config/plugins/<plugin>/`
+    /// (`.mcp.json`, `mcp.json`, `mcp_config.json`, or `plugin.json` defining
+    /// `mcpServers`/`mcp`), returning both the discovered config files and
+    /// per-plugin directory stamps so adding a config inside an existing plugin
+    /// directory invalidates the cache on the next pass.
+    fn discover_gemini_plugin_mcp_configs(root: &Path, limit: usize) -> GeminiPluginDiscovery {
+        let mut configs = Vec::new();
+        let mut subdirs = Vec::new();
+        let Ok(plugins) = fs::read_dir(root) else {
+            return GeminiPluginDiscovery { configs, subdirs };
+        };
+        for plugin in plugins.filter_map(Result::ok) {
+            if subdirs.len() >= limit {
+                break;
+            }
+            if !plugin.file_type().is_ok_and(|ft| ft.is_dir()) {
+                continue;
+            }
+            let dir_path = plugin.path();
+            let dir_stamp = FileStamp::of(&dir_path);
+            subdirs.push((dir_path.clone(), dir_stamp));
+            for (name, kind) in [
+                (".mcp.json", ConfigKind::McpJson),
+                ("mcp.json", ConfigKind::McpJson),
+                ("mcp_config.json", ConfigKind::McpJson),
+                ("plugin.json", ConfigKind::OpencodeJson),
+            ] {
+                if configs.len() >= limit {
+                    break;
+                }
+                let cfg = dir_path.join(name);
+                if cfg.is_file() {
+                    configs.push((cfg, kind));
+                }
+            }
+        }
+        configs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        configs.dedup_by(|a, b| a.0 == b.0);
+        subdirs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        GeminiPluginDiscovery { configs, subdirs }
+    }
+
+    /// Discover custom `~/.gemini/<app_data_dir>/mcp_config.json` files beyond
+    /// the standard `antigravity`, `antigravity-ide`, `antigravity-cli`, and
+    /// `config` directories, bounded at `limit` files.
+    fn discover_gemini_data_dir_mcp_configs(root: &Path, limit: usize) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if found.len() >= limit {
+                break;
+            }
+            if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            if matches!(
+                name.to_str(),
+                Some("antigravity" | "antigravity-ide" | "antigravity-cli" | "config")
+            ) {
+                continue;
+            }
+            let cfg = entry.path().join("mcp_config.json");
+            if cfg.is_file() {
+                found.push(cfg);
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    /// Discover `.mcp.json` files inside `~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/.mcp.json`
+    /// (also checking 2-level `<marketplace>/<plugin>/.mcp.json`), bounded at `limit` files.
+    fn discover_codex_plugin_mcp_configs(root: &Path, limit: usize) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(marketplaces) = fs::read_dir(root) else {
+            return found;
+        };
+        for mp in marketplaces.filter_map(Result::ok) {
+            if found.len() >= limit {
+                break;
+            }
+            if !mp.file_type().is_ok_and(|ft| ft.is_dir()) {
+                continue;
+            }
+            let Ok(plugins) = fs::read_dir(mp.path()) else {
+                continue;
+            };
+            for plugin in plugins.filter_map(Result::ok) {
+                if found.len() >= limit {
+                    break;
+                }
+                if !plugin.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    continue;
+                }
+                let direct = plugin.path().join(".mcp.json");
+                if direct.is_file() {
+                    found.push(direct);
+                    if found.len() >= limit {
+                        break;
+                    }
+                }
+                let Ok(versions) = fs::read_dir(plugin.path()) else {
+                    continue;
+                };
+                for ver in versions.filter_map(Result::ok) {
+                    if found.len() >= limit {
+                        break;
+                    }
+                    if !ver.file_type().is_ok_and(|ft| ft.is_dir()) {
+                        continue;
+                    }
+                    let cfg = ver.path().join(".mcp.json");
+                    if cfg.is_file() {
+                        found.push(cfg);
+                    }
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    impl McpCache {
+        fn new(home: &Path) -> Self {
+            let global_extras = vec![
+                ExtraConfigEntry::new(
+                    home.join("Library/Application Support/Claude/claude_desktop_config.json"),
+                    ConfigKind::McpJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join(".gemini/antigravity/mcp_config.json"),
+                    ConfigKind::McpJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join(".gemini/antigravity-ide/mcp_config.json"),
+                    ConfigKind::McpJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join(".gemini/antigravity-cli/mcp_config.json"),
+                    ConfigKind::McpJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join(".gemini/antigravity-cli/settings.json"),
+                    ConfigKind::OpencodeJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join(".gemini/config/mcp_config.json"),
+                    ConfigKind::McpJson,
+                ),
+                ExtraConfigEntry::new(home.join(".gemini/settings.json"), ConfigKind::OpencodeJson),
+                ExtraConfigEntry::new(home.join(".cursor/mcp.json"), ConfigKind::McpJson),
+                ExtraConfigEntry::new(
+                    home.join(".codeium/windsurf/mcp_config.json"),
+                    ConfigKind::McpJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join("Library/Application Support/Code/User/mcp.json"),
+                    ConfigKind::McpJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join(".config/zed/settings.json"),
+                    ConfigKind::OpencodeJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join(".config/opencode/opencode.json"),
+                    ConfigKind::OpencodeJson,
+                ),
+                ExtraConfigEntry::new(
+                    home.join(".config/opencode/opencode.jsonc"),
+                    ConfigKind::OpencodeJson,
+                ),
+            ];
             Self {
                 codex: ConfigStamp::default(),
+                codex_servers: Vec::new(),
+                codex_projects: Vec::new(),
+                codex_plugins_dir: ConfigStamp::default(),
+                codex_plugin_configs: Vec::new(),
                 claude: ConfigStamp::default(),
+                claude_servers: Vec::new(),
+                claude_projects: Vec::new(),
+                claude_plugins: ConfigStamp::default(),
+                plugin_dirs: Vec::new(),
+                gemini_dir: ConfigStamp::default(),
+                gemini_data_dir_configs: Vec::new(),
+                gemini_plugins_dir: ConfigStamp::default(),
+                gemini_plugin_subdirs: Vec::new(),
+                gemini_plugin_configs: Vec::new(),
+                global_extras,
+                dynamic_extras: Vec::new(),
                 combined: Arc::from([]),
                 has_distinctive: false,
+                has_pool_signatures: false,
                 generation: 0,
             }
+        }
+
+        fn rebuild_dynamic_targets(&mut self, codex_config: &Path) {
+            const MAX_DYNAMIC_PROJECTS: usize = 128;
+            const MAX_DYNAMIC_PLUGINS: usize = 64;
+
+            let mut project_dirs: Vec<&str> = Vec::new();
+            for dir in self
+                .claude_projects
+                .iter()
+                .chain(self.codex_projects.iter())
+            {
+                if project_dirs.len() >= MAX_DYNAMIC_PROJECTS {
+                    break;
+                }
+                if !project_dirs.contains(&dir.as_str()) {
+                    project_dirs.push(dir.as_str());
+                }
+            }
+
+            let mut desired: Vec<(PathBuf, ConfigKind)> = Vec::new();
+            for dir in project_dirs {
+                let root = Path::new(dir);
+                desired.push((root.join(".mcp.json"), ConfigKind::McpJson));
+                let proj_codex = root.join(".codex/config.toml");
+                if proj_codex != codex_config {
+                    desired.push((proj_codex, ConfigKind::CodexToml));
+                }
+                desired.push((root.join("opencode.json"), ConfigKind::OpencodeJson));
+                desired.push((root.join("opencode.jsonc"), ConfigKind::OpencodeJson));
+            }
+            for dir in self.plugin_dirs.iter().take(MAX_DYNAMIC_PLUGINS) {
+                let root = Path::new(dir);
+                desired.push((root.join(".mcp.json"), ConfigKind::McpJson));
+            }
+            for cfg in self.codex_plugin_configs.iter().take(MAX_DYNAMIC_PLUGINS) {
+                desired.push((cfg.clone(), ConfigKind::McpJson));
+            }
+            for cfg in self
+                .gemini_data_dir_configs
+                .iter()
+                .take(MAX_DYNAMIC_PLUGINS)
+            {
+                desired.push((cfg.clone(), ConfigKind::McpJson));
+            }
+            for (cfg, kind) in self.gemini_plugin_configs.iter().take(MAX_DYNAMIC_PLUGINS) {
+                desired.push((cfg.clone(), *kind));
+            }
+
+            let old = std::mem::take(&mut self.dynamic_extras);
+            let mut next = Vec::with_capacity(desired.len());
+            for (path, kind) in desired {
+                if let Some(existing) = old.iter().position(|e| e.path == path) {
+                    // Reuse existing stamp & parsed servers when unchanged.
+                    let entry = &old[existing];
+                    next.push(ExtraConfigEntry {
+                        path,
+                        kind,
+                        stamp: ConfigStamp {
+                            initialized: entry.stamp.initialized,
+                            stamp: entry.stamp.stamp,
+                        },
+                        servers: entry.servers.clone(),
+                    });
+                } else {
+                    next.push(ExtraConfigEntry::new(path, kind));
+                }
+            }
+            self.dynamic_extras = next;
         }
     }
 
@@ -286,48 +607,240 @@ pub mod macos {
         }
     }
 
+    type OpencodeActivityCache = (Option<FileStamp>, Option<FileStamp>, Option<u64>);
+
     pub struct MacOs {
         codex_config: PathBuf,
+        codex_plugins_cache: PathBuf,
         claude_config: PathBuf,
+        claude_plugins: PathBuf,
+        gemini_plugins_dir: PathBuf,
         codex_sessions: PathBuf,
+        gemini_dir: PathBuf,
+        opencode_data: PathBuf,
+        opencode_state: PathBuf,
         mcp_cache: RefCell<McpCache>,
         watch_cache: RefCell<WatchCache>,
         last_rollout: RefCell<Option<PathBuf>>,
+        last_antigravity_files: RefCell<BTreeMap<CompactString, PathBuf>>,
+        opencode_activity_cache: RefCell<Option<OpencodeActivityCache>>,
     }
 
     impl MacOs {
         pub fn new(home: PathBuf) -> Self {
+            let mcp_cache = McpCache::new(&home);
             Self {
                 codex_config: home.join(".codex/config.toml"),
+                codex_plugins_cache: home.join(".codex/plugins/cache"),
                 claude_config: home.join(".claude.json"),
+                claude_plugins: home.join(".claude/plugins/installed_plugins.json"),
+                gemini_plugins_dir: home.join(".gemini/config/plugins"),
                 codex_sessions: home.join(".codex/sessions"),
-                mcp_cache: RefCell::new(McpCache::default()),
+                gemini_dir: home.join(".gemini"),
+                opencode_data: home.join(".local/share/opencode"),
+                opencode_state: home.join(".local/state/opencode"),
+                mcp_cache: RefCell::new(mcp_cache),
                 watch_cache: RefCell::new(WatchCache::default()),
                 last_rollout: RefCell::new(None),
+                last_antigravity_files: RefCell::new(BTreeMap::new()),
+                opencode_activity_cache: RefCell::new(None),
             }
         }
 
-        fn load_mcp_servers(&self) -> (Arc<[ServerSignature]>, bool, u64) {
+        fn load_mcp_servers(&self) -> (Arc<[ServerSignature]>, bool, bool, u64) {
             let mut cache = self.mcp_cache.borrow_mut();
+            let mut any_changed = false;
+            let mut index_changed = false;
+
             let codex_stamp = FileStamp::of(&self.codex_config);
+            if !cache.codex.is_fresh(codex_stamp) {
+                any_changed = true;
+                index_changed = true;
+                cache.codex_servers.clear();
+                cache.codex_projects.clear();
+                if codex_stamp.is_none() {
+                    cache.codex.initialized = true;
+                    cache.codex.stamp = None;
+                } else {
+                    match File::open(&self.codex_config) {
+                        Ok(file) => {
+                            let opened_stamp = file
+                                .metadata()
+                                .ok()
+                                .map(|meta| FileStamp::from_metadata(&meta));
+                            let (servers, projects) = probe::codex_config_from_reader(file);
+                            cache.codex_servers = servers;
+                            cache.codex_projects = projects;
+                            cache.codex.stamp = opened_stamp;
+                            cache.codex.initialized = opened_stamp.is_some();
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            cache.codex.initialized = true;
+                            cache.codex.stamp = None;
+                        }
+                        Err(_) => {
+                            cache.codex.initialized = false;
+                            cache.codex.stamp = None;
+                        }
+                    }
+                }
+            }
+
+            let codex_plugins_stamp = FileStamp::of(&self.codex_plugins_cache);
+            if !cache.codex_plugins_dir.is_fresh(codex_plugins_stamp) || index_changed {
+                let next_configs = if codex_plugins_stamp.is_some() {
+                    discover_codex_plugin_mcp_configs(&self.codex_plugins_cache, 64)
+                } else {
+                    Vec::new()
+                };
+                if next_configs != cache.codex_plugin_configs {
+                    cache.codex_plugin_configs = next_configs;
+                    any_changed = true;
+                    index_changed = true;
+                }
+                cache.codex_plugins_dir.stamp = codex_plugins_stamp;
+                cache.codex_plugins_dir.initialized = true;
+            }
+
             let claude_stamp = FileStamp::of(&self.claude_config);
-            if !(cache.codex.is_fresh(codex_stamp) && cache.claude.is_fresh(claude_stamp)) {
+            if !cache.claude.is_fresh(claude_stamp) {
+                any_changed = true;
+                index_changed = true;
+                cache.claude_servers.clear();
+                cache.claude_projects.clear();
+                if claude_stamp.is_none() {
+                    cache.claude.initialized = true;
+                    cache.claude.stamp = None;
+                } else {
+                    match File::open(&self.claude_config) {
+                        Ok(file) => {
+                            let opened_stamp = file
+                                .metadata()
+                                .ok()
+                                .map(|meta| FileStamp::from_metadata(&meta));
+                            let (servers, projects) = probe::claude_config_from_reader(file);
+                            cache.claude_servers = servers;
+                            cache.claude_projects = projects;
+                            cache.claude.stamp = opened_stamp;
+                            cache.claude.initialized = opened_stamp.is_some();
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            cache.claude.initialized = true;
+                            cache.claude.stamp = None;
+                        }
+                        Err(_) => {
+                            cache.claude.initialized = false;
+                            cache.claude.stamp = None;
+                        }
+                    }
+                }
+            }
+
+            let plugins_stamp = FileStamp::of(&self.claude_plugins);
+            if !cache.claude_plugins.is_fresh(plugins_stamp) {
+                any_changed = true;
+                index_changed = true;
+                cache.plugin_dirs.clear();
+                if plugins_stamp.is_none() {
+                    cache.claude_plugins.initialized = true;
+                    cache.claude_plugins.stamp = None;
+                } else {
+                    match File::open(&self.claude_plugins) {
+                        Ok(file) => {
+                            let opened_stamp = file
+                                .metadata()
+                                .ok()
+                                .map(|meta| FileStamp::from_metadata(&meta));
+                            cache.plugin_dirs =
+                                probe::claude_installed_plugin_paths_from_reader(file);
+                            cache.claude_plugins.stamp = opened_stamp;
+                            cache.claude_plugins.initialized = opened_stamp.is_some();
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            cache.claude_plugins.initialized = true;
+                            cache.claude_plugins.stamp = None;
+                        }
+                        Err(_) => {
+                            cache.claude_plugins.initialized = false;
+                            cache.claude_plugins.stamp = None;
+                        }
+                    }
+                }
+            }
+
+            let gemini_dir_stamp = FileStamp::of(&self.gemini_dir);
+            if !cache.gemini_dir.is_fresh(gemini_dir_stamp) || index_changed {
+                let next_configs = if gemini_dir_stamp.is_some() {
+                    discover_gemini_data_dir_mcp_configs(&self.gemini_dir, 32)
+                } else {
+                    Vec::new()
+                };
+                if next_configs != cache.gemini_data_dir_configs {
+                    cache.gemini_data_dir_configs = next_configs;
+                    any_changed = true;
+                    index_changed = true;
+                }
+                cache.gemini_dir.stamp = gemini_dir_stamp;
+                cache.gemini_dir.initialized = true;
+            }
+
+            let gemini_plugins_stamp = FileStamp::of(&self.gemini_plugins_dir);
+            let gemini_plugin_subdir_changed = cache
+                .gemini_plugin_subdirs
+                .iter()
+                .any(|(dir, stamp)| FileStamp::of(dir) != *stamp);
+            if !cache.gemini_plugins_dir.is_fresh(gemini_plugins_stamp)
+                || gemini_plugin_subdir_changed
+                || index_changed
+            {
+                let discovered = if gemini_plugins_stamp.is_some() {
+                    discover_gemini_plugin_mcp_configs(&self.gemini_plugins_dir, 64)
+                } else {
+                    GeminiPluginDiscovery {
+                        configs: Vec::new(),
+                        subdirs: Vec::new(),
+                    }
+                };
+                if discovered.configs != cache.gemini_plugin_configs {
+                    cache.gemini_plugin_configs = discovered.configs;
+                    any_changed = true;
+                    index_changed = true;
+                }
+                cache.gemini_plugin_subdirs = discovered.subdirs;
+                cache.gemini_plugins_dir.stamp = gemini_plugins_stamp;
+                cache.gemini_plugins_dir.initialized = true;
+            }
+
+            if index_changed {
+                cache.rebuild_dynamic_targets(&self.codex_config);
+            }
+
+            for entry in &mut cache.global_extras {
+                if entry.refresh() {
+                    any_changed = true;
+                }
+            }
+            for entry in &mut cache.dynamic_extras {
+                if entry.refresh() {
+                    any_changed = true;
+                }
+            }
+
+            if any_changed {
                 let mut combined = Vec::new();
-                cache.codex.load_into(
-                    &self.codex_config,
-                    codex_stamp,
-                    probe::codex_servers_from_reader,
-                    &mut combined,
-                );
-                cache.claude.load_into(
-                    &self.claude_config,
-                    claude_stamp,
-                    probe::claude_servers_from_reader,
-                    &mut combined,
-                );
+                combined.extend(cache.codex_servers.iter().cloned());
+                combined.extend(cache.claude_servers.iter().cloned());
+                for entry in &cache.global_extras {
+                    combined.extend(entry.servers.iter().cloned());
+                }
+                for entry in &cache.dynamic_extras {
+                    combined.extend(entry.servers.iter().cloned());
+                }
                 let combined = probe::dedup_signatures(combined);
                 if combined.as_slice() != &*cache.combined {
                     cache.has_distinctive = combined.iter().any(ServerSignature::is_distinctive);
+                    cache.has_pool_signatures =
+                        combined.iter().any(ServerSignature::is_pool_signature);
                     cache.combined = Arc::from(combined);
                     cache.generation = cache.generation.wrapping_add(1);
                 }
@@ -335,6 +848,7 @@ pub mod macos {
             (
                 Arc::clone(&cache.combined),
                 cache.has_distinctive,
+                cache.has_pool_signatures,
                 cache.generation,
             )
         }
@@ -804,12 +1318,12 @@ pub mod macos {
                             .finish(|line| on_event(idx, GroupEvent::Line(line)));
                         slot.stdout = None;
                         // Give fast optional children whose verified output
-                        // filters a slower sibling (e.g. `launchctl list`) a
-                        // brief reap window right at EOF; skip for other slots
-                        // so they never stall draining `ps`.
+                        // filters a slower sibling (e.g. `launchctl list`), or
+                        // required children whose failure must abort stalled
+                        // optional siblings promptly, a brief reap window at EOF.
                         let mut status = slot.child.try_wait().ok().flatten();
-                        if status.is_none() && slot.eager_reap {
-                            for delay_us in [0u64, 0, 100, 250, 500] {
+                        if status.is_none() && (slot.eager_reap || slot.required) {
+                            for delay_us in [0u64, 0, 100, 250, 500, 1000] {
                                 if delay_us == 0 {
                                     std::thread::yield_now();
                                 } else {
@@ -977,27 +1491,181 @@ pub mod macos {
         codex_activity_walk(root, early_exit_after).map(|(secs, _)| secs)
     }
 
-    /// PIDs whose `args` column is read by ownership classification: Codex
-    /// runtimes and their non-bundled helper children inside the app, plus
-    /// non-launchd `ppid == 1` orphan candidates not already in `known_helpers`.
+    /// Newest Antigravity conversation/summary write under `~/.gemini/antigravity`.
+    /// Checks O(1) root summary files first, then scans `conversations/` once with
+    /// early exit when `early_exit_after` is satisfied.
+    fn antigravity_activity_walk(
+        root: &Path,
+        early_exit_after: Option<u64>,
+    ) -> Option<(u64, PathBuf)> {
+        let mut newest: Option<(u64, PathBuf)> = None;
+        for name in [
+            "conversation_summaries.db-wal",
+            "conversation_summaries.db",
+            "agyhub_summaries_proto.pb",
+            "jetbox_summaries_proto.pb",
+            "history.jsonl",
+        ] {
+            let path = root.join(name);
+            if let Some(secs) = file_mtime_secs(&path) {
+                if newest.as_ref().is_none_or(|(prev, _)| secs > *prev) {
+                    newest = Some((secs, path));
+                }
+                if early_exit_after.is_some_and(|cutoff| secs > cutoff) {
+                    return newest;
+                }
+            }
+        }
+        let conv_dir = root.join("conversations");
+        if let Ok(entries) = fs::read_dir(&conv_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified())
+                    && let Ok(elapsed) = modified.duration_since(UNIX_EPOCH)
+                {
+                    let secs = elapsed.as_secs();
+                    if newest.as_ref().is_none_or(|(prev, _)| secs > *prev) {
+                        newest = Some((secs, entry.path()));
+                    }
+                    if early_exit_after.is_some_and(|cutoff| secs > cutoff) {
+                        return newest;
+                    }
+                }
+            }
+        }
+        newest
+    }
+
+    const OPENCODE_SQL_V2: &str = "SELECT max(ts) FROM (SELECT max(time_updated) AS ts FROM session_v2 UNION ALL SELECT max(time_created) AS ts FROM session_message UNION ALL SELECT max(time_updated) AS ts FROM session_part);";
+    const OPENCODE_SQL_V1: &str = "SELECT max(ts) FROM (SELECT max(time_updated) AS ts FROM session UNION ALL SELECT max(time_created) AS ts FROM message);";
+    const SQLITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn query_sqlite_max_timestamp(db_path: &Path, sql: &str) -> Result<Option<u64>, ()> {
+        let db_arg = db_path.to_str().ok_or(())?;
+        let mut parsed: Option<u64> = None;
+        let status = run_lines_with_timeout(
+            "/usr/bin/sqlite3",
+            &["-readonly", "-cmd", ".timeout 500", db_arg, sql],
+            SQLITE_TIMEOUT,
+            |bytes| {
+                with_line_str(bytes, |line| {
+                    let trimmed = line.trim();
+                    if let Ok(raw) = trimmed.parse::<u64>()
+                        && raw > 0
+                    {
+                        // OpenCode stores Unix milliseconds; normalize to seconds.
+                        let secs = if raw > 10_000_000_000 {
+                            raw / 1000
+                        } else {
+                            raw
+                        };
+                        parsed = Some(parsed.map_or(secs, |prev| prev.max(secs)));
+                    }
+                });
+            },
+        )
+        .map_err(|_| ())?;
+        if status.success() {
+            Ok(parsed)
+        } else {
+            Err(())
+        }
+    }
+
+    /// Authoritative OpenCode session activity timestamp in Unix seconds.
+    ///
+    /// Queries real session/message timestamps from `~/.local/share/opencode/opencode.db`
+    /// via read-only `sqlite3` (which transparently reads uncommitted WAL frames
+    /// while ignoring OpenCode's 5-minute background `kv` catalog writes to
+    /// `opencode.db-wal` and background fs-watcher entries in `opencode.log`),
+    /// combined with `~/.local/state/opencode/prompt-history.jsonl` mtime.
+    fn query_opencode_db_activity(db_path: &Path) -> Option<u64> {
+        if !db_path.is_file() {
+            return None;
+        }
+        if let Ok(ts) = query_sqlite_max_timestamp(db_path, OPENCODE_SQL_V2) {
+            return ts;
+        }
+        if let Ok(ts) = query_sqlite_max_timestamp(db_path, OPENCODE_SQL_V1) {
+            return ts;
+        }
+        // Fallback only when `sqlite3` cannot read the DB (e.g. locked or non-SQLite fixture);
+        // intentionally never reads `opencode.db-wal` or `opencode.log` mtime.
+        file_mtime_secs(db_path)
+    }
+
+    /// Whether a `ppid == 1` agent/app executable needs launchd & sidecar
+    /// verification: `(is_ag_bundled_srv, is_sidecar_candidate_app_exe)`.
+    fn ppid1_ag_or_app_check_flags(exe: &str) -> (bool, bool) {
+        let is_ag_bundled_srv =
+            owners::is_antigravity_server_candidate_exe(exe) && exe.contains(".app/Contents/");
+        let is_app_exe = owners::app_bundle_path(exe).is_some()
+            && !owners::is_claude_app_exe(exe)
+            && !owners::is_codex_app_exe(exe)
+            && !owners::is_opencode_app_fallback_exe(exe);
+        (is_ag_bundled_srv, is_app_exe)
+    }
+
+    /// PIDs whose `args` column is read by ownership classification:
+    /// - all Codex, Antigravity `language_server*`, and OpenCode runtimes
+    /// - non-launchd `ppid == 1` app bundle processes not already verified as
+    ///   non-sidecar in `cached_non_mcp_apps` (to distinguish real apps from
+    ///   orphaned Antigravity `sidecar_sdk`, including renamed clones)
+    /// - direct helper children of Codex/Antigravity/OpenCode/`agy` runtimes (including
+    ///   inherited-TTY children when the runtime itself has a TTY!)
+    /// - direct inherited-TTY helper children of TTY-attached Claude CLI sessions
+    /// - `ppid > 1` processes whose executable could match a configured MCP pool
+    ///   signature (enabling generic dynamic discovery of Cursor, Windsurf, Zed,
+    ///   Gemini CLI, and other coding tools)
+    /// - non-launchd `ppid == 1` orphan candidates not already in `known_helpers`.
     fn arg_candidate_pids(
         snapshot: &Snapshot,
         user: u32,
         has_distinctive: bool,
+        has_pool_signatures: bool,
         known_helpers: &BTreeSet<Identity>,
         launchd_jobs: Option<&[i32]>,
+        cached_non_mcp_apps: &[i32],
     ) -> Vec<i32> {
         let processes = &snapshot.processes;
         let mut pids = Vec::new();
+        let mut runtime_indices: Vec<usize> = Vec::new();
+        let mut tty_claude_indices: Vec<usize> = Vec::new();
 
-        if let Some(app) = processes
-            .iter()
-            .find(|process| process.uid == user && owners::is_codex_app(snapshot, process))
-        {
-            let app_exe = snapshot.exe(app);
-            let bundle = app_exe
-                .strip_suffix("Contents/MacOS/ChatGPT")
-                .unwrap_or(app_exe);
+        for (idx, process) in processes.iter().enumerate() {
+            if process.uid != user {
+                continue;
+            }
+            let exe = snapshot.exe(process);
+            if owners::is_codex_exe(exe)
+                || owners::is_antigravity_server_candidate_exe(exe)
+                || owners::is_opencode_runtime_exe(exe)
+            {
+                pids.push(process.pid);
+                runtime_indices.push(idx);
+            } else if owners::is_antigravity_cli_exe(exe) {
+                runtime_indices.push(idx);
+            } else if process.has_tty && owners::is_claude_session_exe(exe) {
+                tty_claude_indices.push(idx);
+            } else if process.ppid == 1
+                && ppid1_ag_or_app_check_flags(exe).1
+                && cached_non_mcp_apps.binary_search(&process.pid).is_err()
+                && ((owners::is_antigravity_app_fallback_exe(exe)
+                    && launchd_jobs.is_none_or(|jobs| jobs.binary_search(&process.pid).is_err()))
+                    || (launchd_jobs.is_some_and(|jobs| jobs.binary_search(&process.pid).is_err())
+                        && ((!process.has_tty && process.age_secs >= owners::ORPHAN_MIN_AGE_SECS)
+                            || Identity::in_set(
+                                known_helpers,
+                                process.pid,
+                                snapshot.started(process),
+                            ))))
+            {
+                // Distinguish a real desktop app from an orphaned `sidecar_sdk`
+                // (for Antigravity, Antigravity US, or any arbitrarily named clone).
+                pids.push(process.pid);
+            }
+        }
+
+        if !runtime_indices.is_empty() || (has_pool_signatures && !tty_claude_indices.is_empty()) {
             let mut children: Vec<(i32, i32)> = Vec::with_capacity(processes.len());
             for process in processes {
                 if process.pid != process.ppid {
@@ -1011,40 +1679,109 @@ pub mod macos {
                 let len = rest.partition_point(|&(parent, _)| parent == ppid);
                 &rest[..len]
             };
-            let mut visited = vec![false; processes.len()];
-            if let Ok(app_idx) = processes.binary_search_by_key(&app.pid, |p| p.pid) {
-                visited[app_idx] = true;
-            }
-            let mut stack = SmallVec::<[i32; 16]>::new();
-            stack.push(app.pid);
-            while let Some(current) = stack.pop() {
-                for &(_, child) in direct(current) {
-                    let Ok(idx) = processes.binary_search_by_key(&child, |p| p.pid) else {
+
+            for &rt_idx in &runtime_indices {
+                let rt = &processes[rt_idx];
+                let rt_exe = snapshot.exe(rt);
+                let rt_bundle = rt_exe
+                    .split_once(".app/")
+                    .map(|(prefix, _)| &rt_exe[..prefix.len() + ".app/".len()]);
+                let is_ag_server = owners::is_antigravity_server_candidate_exe(rt_exe);
+
+                for &(_, helper_pid) in direct(rt.pid) {
+                    let Ok(h_idx) = processes.binary_search_by_key(&helper_pid, |p| p.pid) else {
                         continue;
                     };
-                    if visited[idx] {
+                    let helper = &processes[h_idx];
+                    if (!rt.has_tty && helper.has_tty) || owners::is_shell(snapshot, helper) {
                         continue;
                     }
-                    visited[idx] = true;
-                    stack.push(child);
-                    let process = &processes[idx];
-                    if owners::is_codex(snapshot, process) {
-                        pids.push(process.pid);
-                        if has_distinctive {
-                            for &(_, helper_pid) in direct(process.pid) {
-                                if let Ok(h_idx) =
-                                    processes.binary_search_by_key(&helper_pid, |p| p.pid)
-                                {
-                                    let helper = &processes[h_idx];
-                                    if !owners::is_shell(snapshot, helper)
-                                        && !owners::is_agent_host(snapshot, helper)
-                                        && !snapshot.exe(helper).starts_with(bundle)
-                                    {
-                                        pids.push(helper_pid);
-                                    }
-                                }
-                            }
+                    let helper_exe = snapshot.exe(helper);
+                    if owners::is_non_helper_command_exe(helper_exe) {
+                        continue;
+                    }
+                    // Always inspect potential Electron sidecars under language_server*.
+                    if is_ag_server && owners::app_bundle_path(helper_exe).is_some() {
+                        pids.push(helper_pid);
+                        continue;
+                    }
+                    if has_pool_signatures
+                        && !owners::is_agent_host_exe(helper_exe)
+                        && !rt_bundle.is_some_and(|bundle| helper_exe.starts_with(bundle))
+                    {
+                        pids.push(helper_pid);
+                    }
+                }
+            }
+
+            if has_pool_signatures {
+                for &cl_idx in &tty_claude_indices {
+                    let cl = &processes[cl_idx];
+                    for &(_, helper_pid) in direct(cl.pid) {
+                        let Ok(h_idx) = processes.binary_search_by_key(&helper_pid, |p| p.pid)
+                        else {
+                            continue;
+                        };
+                        let helper = &processes[h_idx];
+                        if !helper.has_tty
+                            || helper.tty_id != cl.tty_id
+                            || owners::is_shell(snapshot, helper)
+                        {
+                            continue;
                         }
+                        let helper_exe = snapshot.exe(helper);
+                        if !owners::is_non_helper_command_exe(helper_exe)
+                            && !owners::is_agent_host_exe(helper_exe)
+                        {
+                            pids.push(helper_pid);
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_pool_signatures {
+            let pool_sigs: Vec<&ServerSignature> = snapshot
+                .mcp_servers
+                .iter()
+                .filter(|s| s.is_pool_signature())
+                .collect();
+            if !pool_sigs.is_empty() {
+                for process in processes {
+                    if process.uid != user || process.ppid <= 1 {
+                        continue;
+                    }
+                    let exe = snapshot.exe(process);
+                    if owners::is_shell_exe(exe)
+                        || owners::is_non_helper_command_exe(exe)
+                        || owners::is_agent_host_exe(exe)
+                        || owners::app_bundle_path(exe).is_some()
+                    {
+                        continue;
+                    }
+                    if let Ok(p_idx) = processes.binary_search_by_key(&process.ppid, |p| p.pid) {
+                        let parent = &processes[p_idx];
+                        let parent_exe = snapshot.exe(parent);
+                        // Non-TTY Claude sessions already classify all direct helpers without args.
+                        if !parent.has_tty && owners::is_claude_session_exe(parent_exe) {
+                            continue;
+                        }
+                        // Children of a `ppid == 1` non-launchd orphan candidate belong to that orphan.
+                        if owners::is_orphan_base_candidate_fields(
+                            parent.ppid,
+                            parent.uid,
+                            parent.has_tty,
+                            parent.age_secs,
+                            parent_exe,
+                            user,
+                        ) && launchd_jobs
+                            .is_none_or(|jobs| jobs.binary_search(&parent.pid).is_err())
+                        {
+                            continue;
+                        }
+                    }
+                    if pool_sigs.iter().any(|server| server.could_match_exe(exe)) {
+                        pids.push(process.pid);
                     }
                 }
             }
@@ -1192,6 +1929,67 @@ pub mod macos {
         f(&list)
     }
 
+    /// Process one `pid=,args=` line into `snapshot`, interning `args_str`
+    /// whenever the process is needed for runtime/sidecar/helper classification
+    /// and discarding non-matching `ppid == 1` non-MCP daemon args into
+    /// `new_non_mcp`.
+    fn classify_args_line(
+        snapshot: &mut Snapshot,
+        line: &str,
+        user: u32,
+        known_helpers: &BTreeSet<Identity>,
+        launchd_jobs: Option<&[i32]>,
+        mcp_servers: &[ServerSignature],
+        new_non_mcp: &mut Vec<NonMcpEntry>,
+    ) {
+        let Some((pid, args_str)) = probe::parse_pid_column_line(line) else {
+            return;
+        };
+        let Ok(idx) = snapshot.processes.binary_search_by_key(&pid, |p| p.pid) else {
+            return;
+        };
+        let process = snapshot.processes[idx];
+        let exe = snapshot.exe(&process);
+        // Antigravity `language_server*` (including arbitrarily renamed clones)
+        // and Antigravity `sidecar_sdk` always require their args interned for
+        // `Ownership::new`, `--app_data_dir`, and orphan classification.
+        let must_intern = owners::is_antigravity_server_candidate_exe(exe)
+            || owners::is_antigravity_sidecar_args(args_str);
+        let is_non_sidecar_app = process.ppid == 1
+            && process.uid == user
+            && !process.has_tty
+            && process.age_secs >= owners::ORPHAN_MIN_AGE_SECS
+            && owners::app_bundle_path(exe).is_some();
+        let is_orphan_cand = !must_intern
+            && launchd_jobs.is_some_and(|jobs| {
+                (owners::is_orphan_base_candidate(snapshot, &process, user) || is_non_sidecar_app)
+                    && !Identity::in_set(known_helpers, pid, snapshot.started(&process))
+                    && jobs.binary_search(&pid).is_err()
+            });
+        if is_orphan_cand {
+            if args_str.is_empty() {
+                return;
+            }
+            let matched = !is_non_sidecar_app
+                && mcp_servers
+                    .iter()
+                    .any(|s| s.is_distinctive() && s.matches_parts(exe, args_str));
+            if matched {
+                let span = snapshot.intern(args_str);
+                snapshot.processes[idx].args = span;
+            } else if let Some(sk) = pack_started_str(snapshot.started(&process)) {
+                new_non_mcp.push(NonMcpEntry {
+                    pid,
+                    started_key: sk,
+                    exe_hash: hash_exe(exe),
+                });
+            }
+        } else {
+            let span = snapshot.intern(args_str);
+            snapshot.processes[idx].args = span;
+        }
+    }
+
     /// Fetch `args` for `candidate_pids`, matching `ppid == 1` orphan
     /// candidates directly against `mcp_servers` on the streamed stack slice
     /// without storing `args` for non-matching daemons. Returns newly verified
@@ -1209,40 +2007,15 @@ pub mod macos {
         }
         let mut new_non_mcp = Vec::with_capacity(candidate_pids.len());
         let mut handle_line = |line: &str| {
-            let Some((pid, args_str)) = probe::parse_pid_column_line(line) else {
-                return;
-            };
-            let Ok(idx) = snapshot.processes.binary_search_by_key(&pid, |p| p.pid) else {
-                return;
-            };
-            let process = snapshot.processes[idx];
-            let is_orphan_cand = launchd_jobs.is_some_and(|jobs| {
-                owners::is_orphan_base_candidate(snapshot, &process, user)
-                    && !Identity::in_set(known_helpers, pid, snapshot.started(&process))
-                    && jobs.binary_search(&pid).is_err()
-            });
-            if is_orphan_cand {
-                if args_str.is_empty() {
-                    return;
-                }
-                let exe = snapshot.exe(&process);
-                let matched = mcp_servers
-                    .iter()
-                    .any(|s| s.is_distinctive() && s.matches_parts(exe, args_str));
-                if matched {
-                    let span = snapshot.intern(args_str);
-                    snapshot.processes[idx].args = span;
-                } else if let Some(sk) = pack_started_str(snapshot.started(&process)) {
-                    new_non_mcp.push(NonMcpEntry {
-                        pid,
-                        started_key: sk,
-                        exe_hash: hash_exe(exe),
-                    });
-                }
-            } else {
-                let span = snapshot.intern(args_str);
-                snapshot.processes[idx].args = span;
-            }
+            classify_args_line(
+                snapshot,
+                line,
+                user,
+                known_helpers,
+                launchd_jobs,
+                mcp_servers,
+                &mut new_non_mcp,
+            );
         };
 
         if candidate_pids.len() <= TARGETED_PS_MAX_PIDS {
@@ -1330,9 +2103,18 @@ pub mod macos {
             include_user_idle: bool,
         ) -> Result<Snapshot, AppError> {
             let user = getuid().as_raw();
-            let (mcp_servers, has_distinctive, mcp_generation) = self.load_mcp_servers();
+            let (mcp_servers, has_distinctive, has_pool_signatures, mcp_generation) =
+                self.load_mcp_servers();
             let mut cache = self.watch_cache.borrow_mut();
 
+            if !has_distinctive {
+                // Distinctively-configured MCP servers were removed or cleared:
+                // reset the full daemon seed so re-enabling them overlaps
+                // `launchctl` with `ps` again, while keeping cached `.app`
+                // launchd/non-sidecar entries via pruning so steady-state passes
+                // do not re-run `launchctl list` on every tick.
+                cache.launchd_seeded = false;
+            }
             if cache.non_mcp_generation != mcp_generation
                 || cache.non_mcp_passes >= NON_MCP_MAX_PASSES
             {
@@ -1364,6 +2146,9 @@ pub mod macos {
                 swap: crate::model::Swap::default(),
                 user_idle_secs: None,
                 codex_activity_at: None,
+                antigravity_activity_at: None,
+                antigravity_activities: BTreeMap::new(),
+                opencode_activity_at: None,
                 launchd_jobs: None,
                 mcp_servers: Arc::clone(&mcp_servers),
                 processes: Vec::with_capacity(init_cap),
@@ -1377,12 +2162,15 @@ pub mod macos {
             } else {
                 Vec::new()
             };
+            let mut cached_kept_launchd: Vec<i32> = Vec::new();
+            let mut cached_non_mcp_apps: Vec<i32> = Vec::new();
             let mut launchd_seen = [0u64; SEEN_BITSET_WORDS];
             let mut non_mcp_seen = [0u64; SEEN_BITSET_WORDS];
             let mut ps_non_empty = 0usize;
             let mut ps_parsed = 0usize;
             let mut ps_saw_before_launchd = false;
             let mut has_uncached_orphan_candidate = false;
+            let mut has_opencode_pty_candidate = false;
 
             let mut pressure = crate::model::Pressure::default();
             let mut swap = crate::model::Swap::default();
@@ -1470,10 +2258,92 @@ pub mod macos {
                             if row.uid != user {
                                 return;
                             }
-                            let is_agent = owners::is_claude_session_exe(row.exe)
-                                || owners::is_codex_exe(row.exe)
-                                || owners::is_codex_app_exe(row.exe);
-                            if !is_agent {
+                            let is_agent = owners::is_agent_or_app_candidate_exe(row.exe);
+                            if is_agent {
+                                // A desktop-bundled Antigravity `language_server` or an
+                                // orphaned `sidecar_sdk` (whose exe is inside `.app/Contents/MacOS/`)
+                                // at `ppid == 1` may be an orphan after its app exits; verify
+                                // launchd membership (using `cache.launchd` / `cache.non_mcp`
+                                // on steady-state passes while always retaining the process in
+                                // `snapshot.processes` for desktop app & parent-chain discovery).
+                                if row.ppid == 1
+                                    && !row.has_tty
+                                    && row.age_secs >= owners::ORPHAN_MIN_AGE_SECS
+                                {
+                                    let (is_ag_bundled_srv, is_app_exe) =
+                                        ppid1_ag_or_app_check_flags(row.exe);
+                                    if is_ag_bundled_srv || is_app_exe {
+                                        let started_str: &str = if let Some(s) =
+                                            probe::format_lstart_stack(
+                                                row.lstart,
+                                                &mut stack_started,
+                                            ) {
+                                            s
+                                        } else {
+                                            let [w0, w1, w2, w3, w4] = row.lstart;
+                                            heap_started
+                                                .insert(probe::join_five(w0, w1, w2, w3, w4))
+                                        };
+                                        let in_known =
+                                            Identity::in_set(known_helpers, row.pid, started_str);
+                                        if in_known {
+                                            has_uncached_orphan_candidate = true;
+                                        } else {
+                                            let started_key = probe::pack_lstart(row.lstart);
+                                            let mut resolved = false;
+                                            if let Some(sk) = started_key {
+                                                if let Ok(idx) = cache
+                                                    .launchd
+                                                    .binary_search_by_key(&row.pid, |&(p, _)| p)
+                                                    && cache.launchd[idx].1 == sk
+                                                {
+                                                    WatchCache::mark_seen(&mut launchd_seen, idx);
+                                                    cached_kept_launchd.push(row.pid);
+                                                    resolved = true;
+                                                } else if is_app_exe
+                                                    && let Ok(idx) = cache
+                                                        .non_mcp
+                                                        .binary_search_by_key(&row.pid, |entry| {
+                                                            entry.pid
+                                                        })
+                                                {
+                                                    let entry = cache.non_mcp[idx];
+                                                    if entry.started_key == sk
+                                                        && entry.exe_hash == hash_exe(row.exe)
+                                                    {
+                                                        WatchCache::mark_seen(
+                                                            &mut non_mcp_seen,
+                                                            idx,
+                                                        );
+                                                        cached_non_mcp_apps.push(row.pid);
+                                                        resolved = true;
+                                                    }
+                                                }
+                                            }
+                                            if !resolved {
+                                                if launchd_ready {
+                                                    if launchd_raw
+                                                        .as_slice()
+                                                        .binary_search(&row.pid)
+                                                        .is_ok()
+                                                    {
+                                                        if let Some(sk) = started_key {
+                                                            new_launchd_entries.push((row.pid, sk));
+                                                        }
+                                                    } else {
+                                                        has_uncached_orphan_candidate = true;
+                                                    }
+                                                } else {
+                                                    if run_initial_launchd {
+                                                        ps_saw_before_launchd = true;
+                                                    }
+                                                    has_uncached_orphan_candidate = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
                                 let started_str: &str = if let Some(s) =
                                     probe::format_lstart_stack(row.lstart, &mut stack_started)
                                 {
@@ -1495,6 +2365,10 @@ pub mod macos {
                                 if in_known {
                                     if is_base_candidate {
                                         has_uncached_orphan_candidate = true;
+                                    }
+                                } else if owners::is_opencode_pty_exe(row.exe) {
+                                    if is_base_candidate {
+                                        has_opencode_pty_candidate = true;
                                     }
                                 } else if has_distinctive && is_base_candidate {
                                     let started_key = probe::pack_lstart(row.lstart);
@@ -1558,6 +2432,7 @@ pub mod macos {
                             started,
                             age_secs: row.age_secs,
                             has_tty: row.has_tty,
+                            tty_id: row.tty_id,
                             cpu_centis: row.cpu_centis,
                             footprint_bytes: None,
                             exe,
@@ -1594,18 +2469,8 @@ pub mod macos {
                 );
             }
 
-            if has_distinctive {
-                cache.prune_launchd(&launchd_seen);
-                cache.prune_non_mcp(&non_mcp_seen);
-            } else {
-                // Distinctively-configured MCP servers were removed or cleared:
-                // reset the launchd seed so re-enabling them overlaps `launchctl`
-                // with `ps` cleanly on the next pass.
-                cache.launchd.clear();
-                cache.launchd_seeded = false;
-                cache.non_mcp.clear();
-                cache.non_mcp_passes = 0;
-            }
+            cache.prune_launchd(&launchd_seen);
+            cache.prune_non_mcp(&non_mcp_seen);
 
             let filter_launchd_processes =
                 |snapshot: &mut Snapshot, jobs: &[i32], out: &mut Vec<(i32, u32)>| {
@@ -1613,6 +2478,27 @@ pub mod macos {
                     snapshot.processes.retain(|process| {
                         let exe = process.exe.slice(arena);
                         let started = process.started.slice(arena);
+                        if jobs.binary_search(&process.pid).is_err() {
+                            return true;
+                        }
+                        if owners::is_agent_or_app_candidate_exe(exe) {
+                            // Keep desktop apps and agent runtimes in `snapshot.processes`
+                            // so dynamic discovery and parent-walking see them, while
+                            // caching launchd membership for the exact subset that
+                            // `SLOT_PS` checks on steady-state passes.
+                            let (is_ag_bundled_srv, is_app_exe) = ppid1_ag_or_app_check_flags(exe);
+                            if (is_ag_bundled_srv || is_app_exe)
+                                && process.ppid == 1
+                                && process.uid == user
+                                && !process.has_tty
+                                && process.age_secs >= owners::ORPHAN_MIN_AGE_SECS
+                                && !Identity::in_set(known_helpers, process.pid, started)
+                                && let Some(sk) = pack_started_str(started)
+                            {
+                                out.push((process.pid, sk));
+                            }
+                            return true;
+                        }
                         if owners::is_orphan_base_candidate_fields(
                             process.ppid,
                             process.uid,
@@ -1621,7 +2507,6 @@ pub mod macos {
                             exe,
                             user,
                         ) && !Identity::in_set(known_helpers, process.pid, started)
-                            && jobs.binary_search(&process.pid).is_ok()
                         {
                             if let Some(sk) = pack_started_str(started) {
                                 out.push((process.pid, sk));
@@ -1631,6 +2516,16 @@ pub mod macos {
                         true
                     });
                 };
+
+            if has_opencode_pty_candidate
+                && !snapshot.processes.iter().any(|p| {
+                    p.uid == user
+                        && (owners::is_opencode_runtime_exe(snapshot.exe(p))
+                            || owners::is_opencode_app_fallback_exe(snapshot.exe(p)))
+                })
+            {
+                has_uncached_orphan_candidate = true;
+            }
 
             let launchd_jobs = if run_initial_launchd {
                 if launchd_ready {
@@ -1660,15 +2555,21 @@ pub mod macos {
                     None
                 }
             } else {
-                Some(Vec::new())
+                cached_kept_launchd.sort_unstable();
+                cached_kept_launchd.dedup();
+                Some(cached_kept_launchd)
             };
 
+            cached_non_mcp_apps.sort_unstable();
+            cached_non_mcp_apps.dedup();
             let candidate_pids = arg_candidate_pids(
                 &snapshot,
                 user,
                 has_distinctive,
+                has_pool_signatures,
                 known_helpers,
                 launchd_jobs.as_deref(),
+                &cached_non_mcp_apps,
             );
             let new_non_mcp = fetch_args_and_classify_orphans(
                 &mut snapshot,
@@ -1678,9 +2579,7 @@ pub mod macos {
                 launchd_jobs.as_deref(),
                 &mcp_servers,
             )?;
-            if has_distinctive {
-                cache.insert_non_mcp_batch(new_non_mcp);
-            }
+            cache.insert_non_mcp_batch(new_non_mcp);
 
             if !cache.non_mcp.is_empty() {
                 cache.non_mcp_passes = cache.non_mcp_passes.saturating_add(1);
@@ -1726,11 +2625,78 @@ pub mod macos {
             }
         }
 
+        fn antigravity_activity_at(
+            &self,
+            snapshot: &Snapshot,
+            early_exit_after: Option<u64>,
+        ) -> Option<u64> {
+            self.antigravity_activity_at_dir(
+                snapshot,
+                owners::DEFAULT_ANTIGRAVITY_DATA_DIR,
+                early_exit_after,
+            )
+        }
+
+        fn antigravity_activity_at_dir(
+            &self,
+            _snapshot: &Snapshot,
+            data_dir: &str,
+            early_exit_after: Option<u64>,
+        ) -> Option<u64> {
+            if let Some(cutoff) = early_exit_after
+                && let Some(path) = self.last_antigravity_files.borrow().get(data_dir)
+                && let Some(secs) = file_mtime_secs(path)
+                && secs > cutoff
+            {
+                return Some(secs);
+            }
+            let dir_path = self.gemini_dir.join(data_dir);
+            match antigravity_activity_walk(&dir_path, early_exit_after) {
+                Some((secs, path)) => {
+                    self.last_antigravity_files
+                        .borrow_mut()
+                        .insert(CompactString::from(data_dir), path);
+                    Some(secs)
+                }
+                None => {
+                    self.last_antigravity_files.borrow_mut().remove(data_dir);
+                    None
+                }
+            }
+        }
+
+        fn opencode_activity_at(&self, _snapshot: &Snapshot) -> Option<u64> {
+            let db_path = self.opencode_data.join("opencode.db");
+            let wal_path = self.opencode_data.join("opencode.db-wal");
+            let db_stamp = FileStamp::of(&db_path);
+            let wal_stamp = FileStamp::of(&wal_path);
+            let db_ts = {
+                let cached = self.opencode_activity_cache.borrow();
+                if let Some((prev_db, prev_wal, prev_ts)) = *cached
+                    && prev_db == db_stamp
+                    && prev_wal == wal_stamp
+                {
+                    prev_ts
+                } else {
+                    drop(cached);
+                    let queried = query_opencode_db_activity(&db_path);
+                    *self.opencode_activity_cache.borrow_mut() =
+                        Some((db_stamp, wal_stamp, queried));
+                    queried
+                }
+            };
+            let prompt_ts = file_mtime_secs(&self.opencode_state.join("prompt-history.jsonl"));
+            match (db_ts, prompt_ts) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            }
+        }
+
         fn resolve_footprints(&self, snapshot: &mut Snapshot) -> Result<(), AppError> {
             let mut in_table = false;
             run_lines(
                 "/usr/bin/top",
-                &["-l", "1", "-F", "-stats", "pid,mem"],
+                &["-l", "1", "-F", "-R", "-stats", "pid,mem"],
                 |bytes| {
                     with_line_str(bytes, |line| {
                         if !in_table {
@@ -1749,6 +2715,27 @@ pub mod macos {
         fn snapshot(&self) -> Result<Snapshot, AppError> {
             let mut snapshot = self.begin_pass(&BTreeSet::new(), true)?;
             snapshot.codex_activity_at = self.codex_activity_at(&snapshot, None);
+            let default_ag = self.antigravity_activity_at(&snapshot, None);
+            snapshot.antigravity_activity_at = default_ag;
+            snapshot.antigravity_activities.insert(
+                CompactString::const_new(owners::DEFAULT_ANTIGRAVITY_DATA_DIR),
+                default_ag,
+            );
+            let extra_dirs: Vec<CompactString> = snapshot
+                .processes
+                .iter()
+                .filter(|p| owners::is_antigravity_server(&snapshot, p))
+                .filter_map(|p| owners::extract_antigravity_data_dir(snapshot.args(p)))
+                .filter(|&dir| dir != owners::DEFAULT_ANTIGRAVITY_DATA_DIR)
+                .map(CompactString::from)
+                .collect();
+            for dir in extra_dirs {
+                if !snapshot.antigravity_activities.contains_key(dir.as_str()) {
+                    let ts = self.antigravity_activity_at_dir(&snapshot, &dir, None);
+                    snapshot.antigravity_activities.insert(dir, ts);
+                }
+            }
+            snapshot.opencode_activity_at = self.opencode_activity_at(&snapshot);
             self.resolve_footprints(&mut snapshot)?;
             Ok(snapshot)
         }
@@ -1998,12 +2985,13 @@ pub mod macos {
             assert!(mac.load_mcp_servers().0.is_empty());
             fs::set_permissions(&codex_cfg, fs::Permissions::from_mode(0o644)).unwrap();
 
-            let (first, distinctive, gen1) = mac.load_mcp_servers();
+            let (first, distinctive, pool_sigs, gen1) = mac.load_mcp_servers();
             assert_eq!(first.len(), 1);
             assert_eq!(first[0].command, "railway");
             assert!(distinctive);
+            assert!(pool_sigs);
             // Cached hit returns identical data and same generation without re-cloning.
-            let (again, _, gen_again) = mac.load_mcp_servers();
+            let (again, _, _, gen_again) = mac.load_mcp_servers();
             assert_eq!(again, first);
             assert_eq!(gen_again, gen1);
 
@@ -2012,9 +3000,76 @@ pub mod macos {
                 r#"{"mcpServers":{"g":{"command":"gopls","args":["mcp"]}}}"#,
             )
             .unwrap();
-            let (second, _, gen2) = mac.load_mcp_servers();
+            let (second, _, _, gen2) = mac.load_mcp_servers();
             assert_eq!(second.len(), 2);
             assert_ne!(gen2, gen1);
+
+            // Antigravity, OpenCode, project .mcp.json, and installed Claude plugin configs are discovered too.
+            fs::create_dir_all(home.path().join(".gemini/antigravity")).unwrap();
+            fs::write(
+                home.path().join(".gemini/antigravity/mcp_config.json"),
+                r#"{"mcpServers":{"cg":{"command":"codegraph","args":["serve","--mcp"]}}}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(home.path().join(".config/opencode")).unwrap();
+            fs::write(
+                home.path().join(".config/opencode/opencode.json"),
+                r#"{"mcp":{"oc":{"type":"local","command":["uvx","mcp-server-git"]}}}"#,
+            )
+            .unwrap();
+            let proj = home.path().join("my-proj");
+            fs::create_dir_all(&proj).unwrap();
+            fs::write(
+                proj.join(".mcp.json"),
+                r#"{"mcpServers":{"nd":{"command":"npx","args":["-y","next-devtools-mcp@latest"]}}}"#,
+            )
+            .unwrap();
+            let plugin_dir = home.path().join("my-plugin");
+            fs::create_dir_all(&plugin_dir).unwrap();
+            fs::write(
+                plugin_dir.join(".mcp.json"),
+                r#"{"pw":{"command":"npx","args":["@playwright/mcp@latest"]}}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(home.path().join(".claude/plugins")).unwrap();
+            fs::write(
+                home.path().join(".claude/plugins/installed_plugins.json"),
+                format!(
+                    r#"{{"version":2,"plugins":{{"pw@m":[{{"installPath":"{}"}}]}}}}"#,
+                    plugin_dir.display()
+                ),
+            )
+            .unwrap();
+            fs::write(
+                home.path().join(".claude.json"),
+                format!(
+                    r#"{{"mcpServers":{{"g":{{"command":"gopls","args":["mcp"]}}}},"projects":{{"{}":{{"mcpServers":{{}}}}}}}}"#,
+                    proj.display()
+                ),
+            )
+            .unwrap();
+
+            let codex_plugin = home
+                .path()
+                .join(".codex/plugins/cache/openai-curated-remote/creative-production/0.1.25");
+            fs::create_dir_all(&codex_plugin).unwrap();
+            fs::write(
+                codex_plugin.join(".mcp.json"),
+                r#"{"mcpServers":{"creative_production_mcp":{"command":"node","args":["./mcp/server.bundle.mjs"]}}}"#,
+            )
+            .unwrap();
+
+            let (all, _, has_pool, gen3) = mac.load_mcp_servers();
+            assert!(has_pool);
+            assert_ne!(gen3, gen2);
+            let cmds: Vec<&str> = all.iter().map(|s| s.command.as_str()).collect();
+            assert!(cmds.contains(&"railway"), "{cmds:?}");
+            assert!(cmds.contains(&"gopls"), "{cmds:?}");
+            assert!(cmds.contains(&"codegraph"), "{cmds:?}");
+            assert!(cmds.contains(&"uvx"), "{cmds:?}");
+            assert!(cmds.contains(&"npx"), "{cmds:?}");
+            assert!(cmds.contains(&"node"), "{cmds:?}");
+            assert_eq!(all.len(), 7, "{all:?}");
         }
 
         #[test]
@@ -2027,13 +3082,92 @@ pub mod macos {
             // Launchd jobs (300, 301) and known_helpers (402) are skipped; Codex
             // runtime (210), its non-bundled helpers (211, 212), and non-launchd
             // orphan candidate (400) are included.
-            let pids = arg_candidate_pids(&snap, snap.user, true, &known, launchd);
+            let pids = arg_candidate_pids(&snap, snap.user, true, true, &known, launchd, &[]);
             assert_eq!(pids, [210, 211, 212, 400]);
 
             // When launchctl fails (`None`), orphan candidates are skipped entirely
             // while Codex runtime/helper candidates are still collected.
-            let pids_no_launchd = arg_candidate_pids(&snap, snap.user, true, &known, None);
+            let pids_no_launchd =
+                arg_candidate_pids(&snap, snap.user, true, true, &known, None, &[]);
             assert_eq!(pids_no_launchd, [210, 211, 212]);
+
+            // Generic-only MCP configs (`has_distinctive == false, has_pool_signatures == true`)
+            // still inspect runtime helper args so generic-launcher MCP servers match pools!
+            let pids_pool_only =
+                arg_candidate_pids(&snap, snap.user, false, true, &known, launchd, &[]);
+            assert_eq!(pids_pool_only, [210, 211, 212]);
+
+            // TTY-attached `codex exec` runtime (500) with inherited-TTY MCP child (501),
+            // plus a `ppid == 1` Antigravity app executable (502) that might be a sidecar.
+            snap.push_process(
+                500,
+                1,
+                snap.user,
+                "start-500",
+                300,
+                true,
+                0,
+                None,
+                "/Users/u/.nvm/bin/codex",
+                "",
+            );
+            snap.push_process(
+                501,
+                500,
+                snap.user,
+                "start-501",
+                300,
+                true,
+                0,
+                None,
+                "/opt/homebrew/bin/node",
+                "",
+            );
+            snap.push_process(
+                502,
+                1,
+                snap.user,
+                "start-502",
+                300,
+                false,
+                0,
+                None,
+                "/Users/u/Applications/Antigravity US.app/Contents/MacOS/Antigravity.real",
+                "",
+            );
+            snap.processes.sort_unstable_by_key(|p| p.pid);
+            let pids_tty = arg_candidate_pids(
+                &snap,
+                snap.user,
+                false,
+                true,
+                &known,
+                snap.launchd_jobs.as_deref(),
+                &[],
+            );
+            assert!(pids_tty.contains(&500), "{pids_tty:?}");
+            assert!(
+                pids_tty.contains(&501),
+                "inherited-TTY MCP helper must have args fetched: {pids_tty:?}"
+            );
+            assert!(
+                pids_tty.contains(&502),
+                "ppid==1 Antigravity exe must have args fetched for sidecar check: {pids_tty:?}"
+            );
+            // Already-verified non-sidecar `.app` cached in `cached_non_mcp_apps` is skipped!
+            let pids_cached = arg_candidate_pids(
+                &snap,
+                snap.user,
+                false,
+                true,
+                &known,
+                snap.launchd_jobs.as_deref(),
+                &[502],
+            );
+            assert!(
+                !pids_cached.contains(&502),
+                "cached non-sidecar app must not re-fetch args: {pids_cached:?}"
+            );
         }
 
         #[test]
@@ -2092,16 +3226,30 @@ pub mod macos {
                 assert!(cache.non_mcp_passes <= 1);
             }
 
-            // Clearing MCP configs drops `has_distinctive`: launchd_seeded must
-            // reset so restoring configs overlaps `launchctl` cleanly again.
+            // Clearing MCP configs drops `has_distinctive`: full daemon seeding
+            // resets (`launchd_seeded == false`), non-app daemons are pruned,
+            // while live `.app` launchd entries remain cached so subsequent
+            // `!has_distinctive` passes skip repeated `launchctl list` calls.
             fs::remove_file(&codex_cfg).unwrap();
             fs::remove_file(home.path().join(".claude.json")).unwrap();
-            let _snap4 = mac.begin_pass(&known, false).unwrap();
+            let snap4 = mac.begin_pass(&known, false).unwrap();
+            assert!(snap4.launchd_jobs.is_some());
+            let app_launchd_count = {
+                let cache = mac.watch_cache.borrow();
+                assert!(!cache.launchd_seeded);
+                assert!(
+                    cache.launchd.len() <= launchd_count_1,
+                    "non-app launchd daemons should be pruned when !has_distinctive"
+                );
+                cache.launchd.len()
+            };
+            // Second pass without distinctive configs reuses cached `.app` launchd entries.
+            let snap4b = mac.begin_pass(&known, false).unwrap();
+            assert!(snap4b.launchd_jobs.is_some());
             {
                 let cache = mac.watch_cache.borrow();
                 assert!(!cache.launchd_seeded);
-                assert!(cache.launchd.is_empty());
-                assert!(cache.non_mcp.is_empty());
+                assert_eq!(cache.launchd.len(), app_launchd_count);
             }
 
             fs::write(
@@ -2217,6 +3365,462 @@ pub mod macos {
             assert!(long.len() > 4096);
             assert!(long.starts_with("100000,100001,"));
             assert!(long.ends_with(",100699"));
+        }
+
+        #[test]
+        fn antigravity_and_opencode_activity_probes_read_latest_mtimes() {
+            let home = tempfile::tempdir().unwrap();
+            let mac = MacOs::new(home.path().to_owned());
+            let snap = Snapshot::default();
+            assert_eq!(mac.antigravity_activity_at(&snap, None), None);
+            assert_eq!(mac.opencode_activity_at(&snap), None);
+
+            let conv_dir = home.path().join(".gemini/antigravity/conversations");
+            fs::create_dir_all(&conv_dir).unwrap();
+            let conv = conv_dir.join("abc.db-wal");
+            fs::write(&conv, b"wal").unwrap();
+            let ag_mtime = mac.antigravity_activity_at(&snap, None).unwrap();
+            assert!(ag_mtime > 0);
+            assert_eq!(
+                mac.antigravity_activity_at(&snap, Some(ag_mtime.saturating_sub(10))),
+                Some(ag_mtime)
+            );
+
+            // Real SQLite OpenCode DB in WAL mode: a 3-hour-old session turn must
+            // NOT be masked by fresh background `kv` writes to `opencode.db-wal`
+            // or fresh watcher entries in `opencode.log`.
+            let oc_dir = home.path().join(".local/share/opencode");
+            let oc_log_dir = oc_dir.join("log");
+            fs::create_dir_all(&oc_log_dir).unwrap();
+            let db_path = oc_dir.join("opencode.db");
+            let session_ts_secs: u64 = 1_795_700_000;
+            let session_ts_ms: u64 = session_ts_secs * 1000 + 544;
+            let init_sql = format!(
+                "PRAGMA journal_mode=WAL;\
+                 CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_updated INTEGER);\
+                 CREATE TABLE session_message (id TEXT PRIMARY KEY, time_created INTEGER);\
+                 CREATE TABLE session_part (id TEXT PRIMARY KEY, time_updated INTEGER);\
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, val TEXT);\
+                 INSERT INTO session_v2 VALUES ('s1', {session_ts_ms});\
+                 INSERT INTO session_message VALUES ('m1', {session_ts_ms});\
+                 INSERT INTO kv VALUES ('models-dev:v3:catalog', 'tick');"
+            );
+            let status = std::process::Command::new("/usr/bin/sqlite3")
+                .arg(&db_path)
+                .arg(&init_sql)
+                .status()
+                .expect("macOS ships /usr/bin/sqlite3");
+            assert!(status.success());
+            fs::write(oc_log_dir.join("opencode.log"), b"watcher restarted\n").unwrap();
+
+            assert_eq!(mac.opencode_activity_at(&snap), Some(session_ts_secs));
+            // Repeated call hits stamp cache and returns the exact same timestamp.
+            assert_eq!(mac.opencode_activity_at(&snap), Some(session_ts_secs));
+        }
+
+        #[test]
+        fn classify_args_line_interns_renamed_clone_server_and_orphaned_sidecars() {
+            use std::collections::BTreeSet;
+
+            use super::classify_args_line;
+
+            let mut snap = Snapshot {
+                user: 501,
+                ..Snapshot::default()
+            };
+            // 1. Renamed Antigravity clone `language_server.real` at `ppid == 1` (no "antigravity" in exe).
+            snap.push_process(
+                600,
+                1,
+                501,
+                "Tue Oct  6 12:00:00 2026",
+                900,
+                false,
+                0,
+                None,
+                "/Users/u/Applications/MyCustomIDE.app/Contents/Resources/bin/language_server.real",
+                "",
+            );
+            // 2. Orphaned `sidecar_sdk` at `ppid == 1` from a renamed clone.
+            snap.push_process(
+                601,
+                1,
+                501,
+                "Tue Oct  6 12:00:00 2026",
+                900,
+                false,
+                0,
+                None,
+                "/Users/u/Applications/MyCustomIDE.app/Contents/MacOS/MyCustomIDE.real",
+                "",
+            );
+            // 3. Orphaned `sidecar_sdk` at `ppid == 1` from `Antigravity US.app`.
+            snap.push_process(
+                602,
+                1,
+                501,
+                "Tue Oct  6 12:00:00 2026",
+                900,
+                false,
+                0,
+                None,
+                "/Users/u/Applications/Antigravity US.app/Contents/MacOS/Antigravity.real",
+                "",
+            );
+            // 4. Non-launchd regular `.app` at `ppid == 1` (not a sidecar) -> cached in `non_mcp`.
+            snap.push_process(
+                603,
+                1,
+                501,
+                "Tue Oct  6 12:00:00 2026",
+                900,
+                false,
+                0,
+                None,
+                "/Applications/SomeEditor.app/Contents/MacOS/SomeEditor",
+                "",
+            );
+            // 5. Unrelated non-MCP daemon at `ppid == 1` -> cached in `non_mcp`, args not interned.
+            snap.push_process(
+                604,
+                1,
+                501,
+                "Tue Oct  6 12:00:00 2026",
+                900,
+                false,
+                0,
+                None,
+                "/usr/local/bin/unrelated-daemon",
+                "",
+            );
+
+            let known = BTreeSet::new();
+            let launchd: &[i32] = &[];
+            let mcp = [crate::model::ServerSignature {
+                command: "railway".into(),
+                args: smallvec::smallvec!["mcp".into()],
+            }];
+            let mut non_mcp = Vec::new();
+
+            classify_args_line(
+                &mut snap,
+                "600 language_server.real --override_ide_name antigravity --app_data_dir my-clone --host_bridge_url=http://127.0.0.1:51982",
+                501,
+                &known,
+                Some(launchd),
+                &mcp,
+                &mut non_mcp,
+            );
+            classify_args_line(
+                &mut snap,
+                "601 MyCustomIDE.real --import=file:///Users/u/.gemini/my-clone/lib/node_modules/sidecar_sdk/register_loader.js main.mjs",
+                501,
+                &known,
+                Some(launchd),
+                &mcp,
+                &mut non_mcp,
+            );
+            classify_args_line(
+                &mut snap,
+                "602 Antigravity.real --import=file:///Users/u/.gemini/antigravity/lib/node_modules/sidecar_sdk/register_loader.js main.mjs",
+                501,
+                &known,
+                Some(launchd),
+                &mcp,
+                &mut non_mcp,
+            );
+            classify_args_line(
+                &mut snap,
+                "603 SomeEditor --new-window",
+                501,
+                &known,
+                Some(launchd),
+                &mcp,
+                &mut non_mcp,
+            );
+            classify_args_line(
+                &mut snap,
+                "604 unrelated-daemon --serve",
+                501,
+                &known,
+                Some(launchd),
+                &mcp,
+                &mut non_mcp,
+            );
+
+            assert!(
+                snap.args(&snap.processes[0])
+                    .contains("--override_ide_name antigravity")
+            );
+            assert!(snap.args(&snap.processes[1]).contains("sidecar_sdk"));
+            assert!(snap.args(&snap.processes[2]).contains("sidecar_sdk"));
+            assert!(snap.args(&snap.processes[3]).is_empty());
+            assert!(snap.args(&snap.processes[4]).is_empty());
+            let non_mcp_pids: Vec<i32> = non_mcp.iter().map(|e| e.pid).collect();
+            assert_eq!(non_mcp_pids, [603, 604]);
+
+            // Ownership::new now classifies 600, 601, and 602 as orphans and skips 603/604!
+            snap.launchd_jobs = Some(Vec::new());
+            let ownership = crate::owners::Ownership::new(&snap, &known);
+            assert_eq!(ownership.orphans.as_slice(), [600, 601, 602]);
+        }
+
+        #[test]
+        fn arg_candidate_pids_covers_renamed_sidecar_and_generic_ide_cli_mcp_helpers() {
+            let mut snap = Snapshot {
+                user: 501,
+                launchd_jobs: Some(vec![1000]),
+                mcp_servers: std::sync::Arc::from([
+                    crate::model::ServerSignature {
+                        command: "npx".into(),
+                        args: smallvec::smallvec!["-y".into(), "@playwright/mcp@latest".into()],
+                    },
+                    crate::model::ServerSignature {
+                        command: "/Users/u/.local/bin/codegraph".into(),
+                        args: smallvec::smallvec!["serve".into(), "--mcp".into()],
+                    },
+                ]),
+                ..Snapshot::default()
+            };
+            // Renamed clone orphaned sidecar at `ppid == 1` (not in launchd_jobs).
+            snap.push_process(
+                902,
+                1,
+                501,
+                "start-902",
+                500,
+                false,
+                0,
+                None,
+                "/Users/u/Applications/MyCustomIDE.app/Contents/MacOS/MyCustomIDE.real",
+                "",
+            );
+            // Live Cursor.app (in launchd_jobs) -> Helper -> node Playwright MCP.
+            snap.push_process(
+                1000,
+                1,
+                501,
+                "start-1000",
+                5000,
+                false,
+                0,
+                None,
+                "/Applications/Cursor.app/Contents/MacOS/Cursor",
+                "",
+            );
+            snap.push_process(
+                1001,
+                1000,
+                501,
+                "start-1001",
+                5000,
+                false,
+                0,
+                None,
+                "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper (Plugin).app/Contents/MacOS/Cursor Helper (Plugin)",
+                "",
+            );
+            snap.push_process(
+                1002,
+                1001,
+                501,
+                "start-1002",
+                5000,
+                false,
+                0,
+                None,
+                "/opt/homebrew/bin/node",
+                "",
+            );
+            // Unrelated child binary under Cursor (`clang`) must NOT be fetched.
+            snap.push_process(
+                1003,
+                1001,
+                501,
+                "start-1003",
+                5000,
+                false,
+                0,
+                None,
+                "/usr/bin/clang",
+                "",
+            );
+            // Standalone `gemini` CLI -> `node` codegraph helper.
+            snap.push_process(
+                2001,
+                1,
+                501,
+                "start-2001",
+                5000,
+                true,
+                0,
+                None,
+                "/opt/homebrew/bin/gemini",
+                "",
+            );
+            snap.push_process(
+                2002,
+                2001,
+                501,
+                "start-2002",
+                5000,
+                true,
+                0,
+                None,
+                "/Users/u/.codegraph/versions/v1.6.4/node",
+                "",
+            );
+
+            let pids = arg_candidate_pids(
+                &snap,
+                501,
+                true,
+                true,
+                &std::collections::BTreeSet::new(),
+                snap.launchd_jobs.as_deref(),
+                &[],
+            );
+            assert!(
+                pids.contains(&902),
+                "renamed clone sidecar candidate: {pids:?}"
+            );
+            assert!(
+                !pids.contains(&1000),
+                "launchd GUI app Cursor skipped: {pids:?}"
+            );
+            assert!(
+                pids.contains(&1002),
+                "Cursor generic node MCP helper: {pids:?}"
+            );
+            assert!(!pids.contains(&1003), "unrelated clang skipped: {pids:?}");
+            assert!(pids.contains(&2002), "gemini CLI MCP helper: {pids:?}");
+        }
+
+        #[test]
+        fn per_dir_antigravity_activity_and_gemini_plugin_and_cli_configs_work() {
+            let home = tempfile::tempdir().unwrap();
+            let mac = MacOs::new(home.path().to_owned());
+            let snap = Snapshot::default();
+
+            // Separate `--app_data_dir` directories track independently, including `history.jsonl`.
+            fs::create_dir_all(home.path().join(".gemini/antigravity/conversations")).unwrap();
+            fs::create_dir_all(home.path().join(".gemini/antigravity-cli")).unwrap();
+            fs::create_dir_all(home.path().join(".gemini/custom-clone")).unwrap();
+            fs::write(
+                home.path().join(".gemini/antigravity/conversations/a.pb"),
+                b"ag",
+            )
+            .unwrap();
+            fs::write(
+                home.path()
+                    .join(".gemini/antigravity-cli/jetbox_summaries_proto.pb"),
+                b"cli",
+            )
+            .unwrap();
+            fs::write(
+                home.path().join(".gemini/custom-clone/history.jsonl"),
+                b"{}\n",
+            )
+            .unwrap();
+
+            assert!(
+                mac.antigravity_activity_at_dir(&snap, "antigravity", None)
+                    .is_some()
+            );
+            assert!(
+                mac.antigravity_activity_at_dir(&snap, "antigravity-cli", None)
+                    .is_some()
+            );
+            assert!(
+                mac.antigravity_activity_at_dir(&snap, "custom-clone", None)
+                    .is_some()
+            );
+            assert_eq!(
+                mac.antigravity_activity_at_dir(&snap, "antigravity-ide", None),
+                None
+            );
+
+            // MCP discovery includes `~/.gemini/antigravity-cli/mcp_config.json`,
+            // custom `~/.gemini/<clone>/mcp_config.json`, `~/.gemini/config/plugins/<plugin>/`,
+            // `~/.cursor/mcp.json`, `~/.config/zed/settings.json`, VS Code `mcp.json`,
+            // and ignores non-MCP `hooks` in `~/.gemini/settings.json`.
+            fs::write(
+                home.path().join(".gemini/antigravity-cli/mcp_config.json"),
+                r#"{"mcpServers":{"cg":{"command":"codegraph","args":["serve","--mcp"]}}}"#,
+            )
+            .unwrap();
+            fs::write(
+                home.path().join(".gemini/custom-clone/mcp_config.json"),
+                r#"{"mcpServers":{"cl":{"command":"custom-mcp","args":["serve"]}}}"#,
+            )
+            .unwrap();
+            fs::write(
+                home.path().join(".gemini/settings.json"),
+                r#"{"hooks":{"pre":{"command":"rtk","args":["hook"]}}}"#,
+            )
+            .unwrap();
+            let gemini_plugin = home.path().join(".gemini/config/plugins/my-mcp-plugin");
+            fs::create_dir_all(&gemini_plugin).unwrap();
+            fs::write(
+                gemini_plugin.join(".mcp.json"),
+                r#"{"mcpServers":{"plug":{"command":"npx","args":["-y","@playwright/mcp@latest"]}}}"#,
+            )
+            .unwrap();
+            let gemini_plugin2 = home.path().join(".gemini/config/plugins/inline-plugin");
+            fs::create_dir_all(&gemini_plugin2).unwrap();
+            fs::write(
+                gemini_plugin2.join("plugin.json"),
+                r#"{"name":"inline","mcpServers":{"r":{"command":"railway","args":["mcp"]}}}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(home.path().join(".cursor")).unwrap();
+            fs::write(
+                home.path().join(".cursor/mcp.json"),
+                r#"{"mcpServers":{"cur":{"command":"uvx","args":["mcp-server-git"]}}}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(home.path().join(".config/zed")).unwrap();
+            fs::write(
+                home.path().join(".config/zed/settings.json"),
+                r#"{"context_servers":{"z":{"command":{"path":"zed-mcp","args":["--stdio"]}}}}"#,
+            )
+            .unwrap();
+            fs::create_dir_all(home.path().join("Library/Application Support/Code/User")).unwrap();
+            fs::write(
+                home.path()
+                    .join("Library/Application Support/Code/User/mcp.json"),
+                r#"{"servers":{"v":{"type":"stdio","command":"vscode-mcp","args":["run"]}}}"#,
+            )
+            .unwrap();
+
+            let (servers, _, _, gen1) = mac.load_mcp_servers();
+            let cmds: Vec<&str> = servers.iter().map(|s| s.command.as_str()).collect();
+            assert!(cmds.contains(&"codegraph"), "{cmds:?}");
+            assert!(cmds.contains(&"custom-mcp"), "{cmds:?}");
+            assert!(cmds.contains(&"npx"), "{cmds:?}");
+            assert!(cmds.contains(&"railway"), "{cmds:?}");
+            assert!(cmds.contains(&"uvx"), "{cmds:?}");
+            assert!(cmds.contains(&"zed-mcp"), "{cmds:?}");
+            assert!(cmds.contains(&"vscode-mcp"), "{cmds:?}");
+            assert!(
+                !cmds.contains(&"rtk"),
+                "hooks in settings.json must not be parsed as MCP servers: {cmds:?}"
+            );
+
+            // Adding a brand-new `mcp_config.json` inside an already-existing plugin
+            // subdirectory without modifying `~/.gemini/config/plugins/` itself must
+            // still invalidate `McpCache` on the very next pass!
+            fs::write(
+                gemini_plugin2.join("mcp_config.json"),
+                r#"{"mcpServers":{"late":{"command":"late-plugin-mcp","args":["--mcp"]}}}"#,
+            )
+            .unwrap();
+            let (servers2, _, _, gen2) = mac.load_mcp_servers();
+            assert_ne!(gen2, gen1);
+            assert!(
+                servers2.iter().any(|s| s.command == "late-plugin-mcp"),
+                "newly added config inside existing plugin subdir must be discovered: {servers2:?}"
+            );
         }
     }
 }

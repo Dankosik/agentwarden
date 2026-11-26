@@ -19,6 +19,8 @@ use crate::{
 
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const KILL_GRACE: Duration = Duration::from_secs(2);
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVICE_QUIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const APP_QUIT_TIMEOUT: Duration = Duration::from_secs(60);
 const QUIT_TIMED_OUT: &str = "app did not quit within 60 s; not forced";
 const RELAUNCH_FAILED: &str = "quit, but relaunch failed";
@@ -57,6 +59,30 @@ pub trait System {
     ) -> Option<u64> {
         snapshot.codex_activity_at
     }
+    /// Newest Antigravity conversation write; when `early_exit_after` is
+    /// `Some(cutoff)`, an implementation may stop scanning once it finds a write `> cutoff`.
+    fn antigravity_activity_at(
+        &self,
+        snapshot: &Snapshot,
+        _early_exit_after: Option<u64>,
+    ) -> Option<u64> {
+        snapshot.antigravity_activity_at
+    }
+    /// Newest Antigravity conversation write for a specific `--app_data_dir`
+    /// subdirectory under `~/.gemini/<data_dir>` (e.g. `"antigravity"`,
+    /// `"antigravity-ide"`, `"antigravity-cli"`).
+    fn antigravity_activity_at_dir(
+        &self,
+        snapshot: &Snapshot,
+        _data_dir: &str,
+        early_exit_after: Option<u64>,
+    ) -> Option<u64> {
+        self.antigravity_activity_at(snapshot, early_exit_after)
+    }
+    /// Newest OpenCode database/log write.
+    fn opencode_activity_at(&self, snapshot: &Snapshot) -> Option<u64> {
+        snapshot.opencode_activity_at
+    }
     /// Populate `footprint_bytes` on `snapshot.processes` when not already set.
     fn resolve_footprints(&self, _snapshot: &mut Snapshot) -> Result<(), AppError> {
         Ok(())
@@ -81,13 +107,46 @@ pub fn execute(system: &dyn System, actions: &[Action], user: u32) -> Vec<Record
                 footprint_bytes,
                 reason,
             } => stop(system, *rule, root, tree, user, *footprint_bytes, reason),
+            Action::StopGraceful {
+                rule,
+                target,
+                footprint_bytes,
+                reason,
+            } => stop_graceful(system, *rule, target, user, *footprint_bytes, reason),
             Action::RestartCodex {
                 rule,
                 app,
                 app_exe,
                 footprint_bytes,
                 reason,
-            } => restart(system, *rule, app, app_exe, user, *footprint_bytes, reason),
+            } => restart(
+                system,
+                *rule,
+                app,
+                app_exe,
+                None,
+                user,
+                *footprint_bytes,
+                reason,
+            ),
+            Action::RestartApp {
+                rule,
+                app,
+                app_exe,
+                service,
+                footprint_bytes,
+                reason,
+                ..
+            } => restart(
+                system,
+                *rule,
+                app,
+                app_exe,
+                service.as_ref(),
+                user,
+                *footprint_bytes,
+                reason,
+            ),
         })
         .collect()
 }
@@ -157,11 +216,43 @@ fn stop(
     record
 }
 
+fn stop_graceful(
+    system: &dyn System,
+    rule: Rule,
+    target: &Target,
+    user: u32,
+    footprint_bytes: u64,
+    reason: &str,
+) -> Record {
+    let mut record = record(system, rule, target, &[], footprint_bytes, reason);
+    if !is_same(system, &target.identity, user) {
+        record.outcome = Outcome::Skipped;
+        record.detail = Some("service changed or exited before the stop".into());
+        return record;
+    }
+    if let Err(error) = system.signal(target.identity.pid, Signal::Term) {
+        record.outcome = Outcome::Failed;
+        record.detail = Some(format!("cannot ask the service to stop: {error}"));
+        return record;
+    }
+    // Never SIGKILL a database-backed service; if it refuses SIGTERM, leave it alone.
+    let mut live = vec![target];
+    if wait_gone(system, &mut live, user, GRACEFUL_STOP_TIMEOUT) {
+        record.outcome = Outcome::Stopped;
+    } else {
+        record.outcome = Outcome::Refused;
+        record.detail = Some("service did not exit within 30 s; not forced".into());
+    }
+    record
+}
+
+#[allow(clippy::too_many_arguments)]
 fn restart(
     system: &dyn System,
     rule: Rule,
     app: &Target,
     app_exe: &str,
+    service: Option<&Target>,
     user: u32,
     footprint_bytes: u64,
     reason: &str,
@@ -189,6 +280,17 @@ fn restart(
         record.detail = Some(QUIT_TIMED_OUT.into());
         return record;
     }
+    // For desktop apps with a companion service/hub (OpenCode's detached
+    // `opencode-cli serve --service`, or Antigravity's `language_server` if it
+    // lingered after the main Electron process exited), gracefully SIGTERM it
+    // before relaunching so the relaunched app starts cleanly without stale pools.
+    if let Some(svc) = service
+        && is_same(system, &svc.identity, user)
+        && system.signal(svc.identity.pid, Signal::Term).is_ok()
+    {
+        let mut live_svc = vec![svc];
+        let _ = wait_gone(system, &mut live_svc, user, SERVICE_QUIT_TIMEOUT);
+    }
     match system.launch_app(bundle) {
         Ok(()) => record.outcome = Outcome::Restarted,
         Err(error) => {
@@ -199,22 +301,28 @@ fn restart(
     record
 }
 
-/// The app bundle to open later when a restart asked the app to quit but did
-/// not see it start again: it quit after the wait, or `open` failed.
-pub fn left_quit(action: &Action, record: &Record) -> Option<PathBuf> {
-    let Action::RestartCodex { app_exe, .. } = action else {
-        return None;
+/// The app bundle and rule to open later when a restart asked the app to quit
+/// but did not see it start again: it quit after the wait, or `open` failed.
+pub fn left_quit(action: &Action, record: &Record) -> Option<(PathBuf, CompactString)> {
+    let (rule, app_exe) = match action {
+        Action::RestartCodex { rule, app_exe, .. } | Action::RestartApp { rule, app_exe, .. } => {
+            (*rule, app_exe.as_str())
+        }
+        _ => return None,
     };
     let detail = record.detail.as_deref().unwrap_or_default();
     let quit_requested = (record.outcome == Outcome::Refused && detail == QUIT_TIMED_OUT)
         || (record.outcome == Outcome::Failed && detail.starts_with(RELAUNCH_FAILED));
     quit_requested
-        .then(|| app_bundle(app_exe).map(Path::to_owned))
+        .then(|| {
+            app_bundle(app_exe)
+                .map(|bundle| (bundle.to_owned(), CompactString::const_new(rule.as_str())))
+        })
         .flatten()
 }
 
 /// Open an app that a restart left quit.
-pub fn relaunch(system: &dyn System, bundle: &Path) -> Record {
+pub fn relaunch(system: &dyn System, bundle: &Path, rule: &str) -> Record {
     let name = bundle
         .file_stem()
         .map_or_else(CompactString::default, |stem| {
@@ -222,7 +330,7 @@ pub fn relaunch(system: &dyn System, bundle: &Path) -> Record {
         });
     let mut record = Record {
         at: system.now(),
-        rule: CompactString::const_new("idle-codex-restart"),
+        rule: CompactString::from(rule),
         outcome: Outcome::Restarted,
         target: name,
         pids: SmallVec::new(),
@@ -238,9 +346,8 @@ pub fn relaunch(system: &dyn System, bundle: &Path) -> Record {
 }
 
 /// `/Applications/ChatGPT.app/Contents/MacOS/ChatGPT` → `/Applications/ChatGPT.app`.
-fn app_bundle(exe: &str) -> Option<&Path> {
-    let (bundle, _) = exe.split_once(".app/Contents/MacOS/")?;
-    Some(Path::new(&exe[..bundle.len() + ".app".len()]))
+pub fn app_bundle(exe: &str) -> Option<&Path> {
+    crate::owners::app_bundle_path(exe).map(Path::new)
 }
 
 fn record(
@@ -455,16 +562,84 @@ pub(crate) mod tests {
         let record = &execute(&slow, std::slice::from_ref(&action), 501)[0];
         assert_eq!(
             super::left_quit(&action, record),
-            Some(PathBuf::from("/Applications/ChatGPT.app"))
+            Some((
+                PathBuf::from("/Applications/ChatGPT.app"),
+                CompactString::const_new("idle-codex-restart"),
+            ))
         );
 
         let quick = system(&[200]);
         let record = &execute(&quick, std::slice::from_ref(&action), 501)[0];
         assert_eq!(super::left_quit(&action, record), None);
 
-        let relaunched = super::relaunch(&quick, Path::new("/Applications/ChatGPT.app"));
+        let relaunched = super::relaunch(
+            &quick,
+            Path::new("/Applications/ChatGPT.app"),
+            "idle-codex-restart",
+        );
         assert_eq!(relaunched.outcome, Outcome::Restarted);
         assert_eq!(relaunched.target, "ChatGPT");
+        assert_eq!(relaunched.rule, "idle-codex-restart");
+    }
+
+    #[test]
+    fn graceful_stop_and_app_restart_with_service_never_force_kill() {
+        let action = Action::StopGraceful {
+            rule: Rule::IdleOpencodeService,
+            target: target(37642),
+            footprint_bytes: 325 << 20,
+            reason: "idle".into(),
+        };
+        let mut stubborn = system(&[37642]);
+        stubborn.immortal.insert(37642);
+        let rec = &execute(&stubborn, std::slice::from_ref(&action), 501)[0];
+        assert_eq!(rec.outcome, Outcome::Refused);
+        assert_eq!(*stubborn.signals.borrow(), [(37642, Signal::Term)]);
+
+        let ok_sys = system(&[37642]);
+        let rec = &execute(&ok_sys, std::slice::from_ref(&action), 501)[0];
+        assert_eq!(rec.outcome, Outcome::Stopped);
+
+        // Antigravity US clone bundle restart.
+        let ag_action = Action::RestartApp {
+            rule: Rule::IdleAntigravityRestart,
+            agent: crate::model::AgentKind::Antigravity,
+            app: target(44215),
+            app_exe: "/Users/u/Applications/Antigravity US.app/Contents/MacOS/Antigravity.real"
+                .into(),
+            service: None,
+            footprint_bytes: 18u64 << 30,
+            reason: "idle".into(),
+        };
+        let ag_sys = system(&[44215]);
+        let rec = &execute(&ag_sys, &[ag_action], 501)[0];
+        assert_eq!(rec.outcome, Outcome::Restarted);
+        assert_eq!(
+            *ag_sys.launched.borrow(),
+            [PathBuf::from("/Users/u/Applications/Antigravity US.app")]
+        );
+
+        // OpenCode desktop restart stops attached service before relaunching app.
+        let oc_action = Action::RestartApp {
+            rule: Rule::IdleOpencodeRestart,
+            agent: crate::model::AgentKind::Opencode,
+            app: target(500),
+            app_exe: "/Applications/OpenCode.app/Contents/MacOS/OpenCode".into(),
+            service: Some(target(501)),
+            footprint_bytes: 1 << 30,
+            reason: "idle".into(),
+        };
+        let oc_sys = system(&[500, 501]);
+        let rec = &execute(&oc_sys, &[oc_action], 501)[0];
+        assert_eq!(rec.outcome, Outcome::Restarted);
+        assert_eq!(
+            *oc_sys.signals.borrow(),
+            [(500, Signal::Term), (501, Signal::Term)]
+        );
+        assert_eq!(
+            *oc_sys.launched.borrow(),
+            [PathBuf::from("/Applications/OpenCode.app")]
+        );
     }
 
     #[test]
@@ -472,6 +647,10 @@ pub(crate) mod tests {
         assert_eq!(
             app_bundle("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
             Some(Path::new("/Applications/ChatGPT.app"))
+        );
+        assert_eq!(
+            app_bundle("/Users/u/Applications/Antigravity US.app/Contents/MacOS/Antigravity.real"),
+            Some(Path::new("/Users/u/Applications/Antigravity US.app"))
         );
         assert_eq!(app_bundle("/usr/bin/codex"), None);
     }

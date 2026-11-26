@@ -5,9 +5,9 @@
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](#install)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Keeps a Mac that runs many AI coding agents (Claude Code, Codex) from filling
-its memory with idle agent helpers. Install it once; it needs no configuration
-and runs in the background from then on.
+Keeps a Mac that runs many AI coding agents (Claude Code, Codex, Antigravity,
+OpenCode) from filling its memory with idle agent helpers. Install it once; it
+needs no configuration and runs in the background from then on.
 
 Every Claude Code session starts its own MCP servers, and the Codex app keeps a
 pool per thread. They stay after the work is done, and helpers whose session
@@ -80,14 +80,22 @@ priority.
 
 Every pass samples processes, their physical footprint (compressed and swapped
 memory included, as `top` reports it), kernel memory pressure, swap, and how
-long the user has been away. Then it applies four rules:
+long the user has been away. Desktop apps (including renamed or proxy-wrapped
+clones such as `Antigravity US.app` or `Codex.app`), background services, CLI
+runs, nested subagents (e.g. Antigravity or Claude Code invoking `codex`), and
+any other running IDE or CLI hosting configured MCP servers (such as Cursor,
+Windsurf, Zed, or Gemini CLI) are discovered dynamically from the live process
+tree. Then it applies these rules:
 
 | Rule | Stops | When |
 | --- | --- | --- |
-| `orphan` | A helper whose agent session has exited (PPID 1), with its descendants | Always, once the helper is 2 minutes old; it must have been seen serving an agent, or match a configured MCP server by a specific program and arguments |
-| `idle-claude-session` | The MCP servers of a Claude Code session that has done nothing: no CPU beyond its timers, no new process, no running shell | Idle 60 min under warning pressure, 15 min under critical; never under normal pressure; the clock restarts after the Mac sleeps |
-| `idle-codex-restart` | The ChatGPT app that hosts Codex, quit and relaunched in the background | No Codex session write for 30 min and no command running under the app however long, user away 30 min, Codex holds ≥ 1 GB (≥ 512 MB under pressure), at most once per 6 hours |
-| Codex helpers one by one | Never | Codex reports a stopped server as "not connected" until it refreshes |
+| `orphan` | A helper whose agent session has exited (PPID 1), with its descendants (excluding VCS/system utilities such as `git`) | Always, once the helper is 2 minutes old; it must have been seen serving an agent (`known_helpers`), match a distinctive configured MCP server, be an orphaned Antigravity `sidecar_sdk`, be an idle childless `opencode-pty` with no OpenCode running, or be an orphaned desktop Antigravity `language_server` whose app has exited |
+| `idle-claude-session` | The MCP servers of a Claude Code session (desktop or terminal CLI) that has done nothing: no CPU beyond its timers, no new process, no running shell, nested agent, or non-helper terminal child (terminal `claude` CLI matches configured MCP servers on the exact inherited controlling TTY) | Idle 60 min under warning pressure, 15 min under critical; never under normal pressure; the clock restarts after the Mac sleeps |
+| `idle-codex-restart` | Any desktop app hosting a bundled Codex runtime (`ChatGPT.app`, `Codex.app`, or clones), quit and relaunched in the background | No Codex session write for 30 min and no command/nested agent running under the app, user away 30 min, Codex holds ≥ 1 GB (≥ 512 MB under pressure), at most once per 6 hours |
+| `idle-antigravity-restart` | Any desktop app hosting Antigravity's `language_server` (`Antigravity.app`, `Antigravity US.app`, or clones), quit and relaunched via its exact bundle | No conversation write in that instance's `--app_data_dir` (`~/.gemini/<name>`, default `antigravity`) for 30 min and no command/TTY/nested agent running under the app, user away 30 min, app holds ≥ 1 GB (≥ 512 MB under pressure), at most once per 6 hours |
+| `idle-opencode-restart` | An idle OpenCode desktop app (and its detached service when no CLI client is open), quit and relaunched in the background | No OpenCode SQLite session write for 30 min and no command/nested agent running, user away 30 min, holds ≥ 1 GB (≥ 512 MB under pressure), at most once per 6 hours |
+| `idle-opencode-service` | A headless `opencode-cli serve --service` daemon (SIGTERM only, never SIGKILL) when no OpenCode app or CLI client is running | Session activity and helper children idle 60 min under warning / 15 min under critical (or 30 min + user away 30 min + ≥ 1 GB under normal), with no running commands |
+| Codex / Antigravity / OpenCode / `other` helpers one by one | Never | Those agents do not reliably lazy-restart killed stdio MCP servers (unknown `other` tools are observed and recorded in `known_helpers` so leaked helpers are reaped by `orphan` after exit) |
 
 Why these are safe: Claude Code starts a stopped MCP server again on the next
 tool call; Codex saves threads to disk, so a restart loses no thread; an orphan
@@ -98,11 +106,15 @@ Safety rules:
 
 - A process is signalled only after its PID and start time are checked again,
   so a reused PID is never hit.
-- Only the current user's processes, never one with a terminal, never a
-  shell, never a launchd service, never an agent itself, and nothing whose
-  tree contains one of those. It refuses to run as root.
-- When a system command fails or prints something it cannot read, the pass
-  stops instead of acting on a partial picture.
+- Only the current user's processes, never a shell, never a launchd service,
+  never a live agent itself, never an unrelated terminal process (terminal
+  `claude` CLI MCP helpers are matched strictly on the parent session's exact
+  inherited TTY), and nothing whose tree contains a protected process. It
+  refuses to run as root.
+- When `/bin/ps` fails or prints something unreadable, the pass stops instead
+  of acting on a partial picture; in `reclaim` and `watch`, `/usr/bin/top`
+  failures degrade non-fatally while conservatively skipping footprint-gated
+  restarts.
 - Children stop before parents: SIGTERM, then SIGKILL after 5 seconds.
 - The app is only asked to quit; if it has not quit within 60 seconds, the
   restart is abandoned and recorded, never forced.
@@ -127,9 +139,11 @@ Safety rules:
 | `swap` | `used_bytes`, `total_bytes` |
 | `user_idle_secs` | Seconds since keyboard or pointer input |
 | `claude_sessions[]` | `pid`, `idle_secs` (null until sampled twice), `helpers_footprint_bytes`, `helpers[]` |
-| `codex` | `app_pid`, `idle_secs`, `footprint_bytes` (what a restart reclaims), `pools_footprint_bytes`, `pools[]`, `commands[]` (running work that blocks a restart); null when the app is not running |
+| `codex` | `app_pid`, `idle_secs`, `footprint_bytes` (what a restart reclaims), `pools_footprint_bytes`, `pools[]`, `commands[]` (running work that blocks a restart); null when no Codex desktop app is running |
+| `desktop_apps[]` | All dynamically discovered desktop agent apps (`agent`: `codex`/`antigravity`/`opencode`/`claude`/`other`, `app_name`, `bundle_path`, `app_pid`, `idle_secs` nullable for `other`/`claude`, `footprint_bytes`, `pools_footprint_bytes`, `pools[]`, `commands[]`) |
+| `agent_sessions[]` | Standalone CLI, background service, and nested subagent sessions (`agent`, `mode`, `pid`, optional `name` for `other` CLIs, optional `parent_agent`, `idle_secs`, `footprint_bytes`, `helpers_footprint_bytes`, `helpers[]`, `commands[]`) |
 | `orphans[]` | `pid`, `exe_name`, `footprint_bytes` (with descendants), `age_secs` |
-| `planned[]` | Actions the rules choose now: `kind` `stop` or `restart-codex`, `rule`, targets, `footprint_bytes`, `reason` |
+| `planned[]` | Actions the rules choose now: `kind` `stop`, `stop-graceful`, `restart-codex`, or `restart-app`, `rule`, targets, `footprint_bytes`, `reason` |
 | `applied[]` | What this run did: `outcome` `stopped`, `skipped`, `failed`, `restarted` or `refused` |
 | `recent[]` | Newest records of the action log |
 
