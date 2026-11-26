@@ -29,11 +29,30 @@ const PARTIAL: u8 = 3;
 
 /// Parse process arguments, perform the requested command, and report once.
 pub fn run() -> ExitCode {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(error) => return report_parser_error(error),
+    // The LaunchAgent invokes bare `agentwarden watch` with no flags; skipping
+    // `clap` initialization keeps its parser tables out of the long-lived
+    // daemon's dirty heap pages. Any flags or `AGENTWARDEN_FORMAT` still go
+    // through `Cli::try_parse()` so validation and errors remain identical.
+    let cli = if is_bare_watch_invocation() {
+        Cli {
+            format: cli::Format::Text,
+            command: cli::Command::Watch,
+        }
+    } else {
+        match Cli::try_parse() {
+            Ok(cli) => cli,
+            Err(error) => return report_parser_error(error),
+        }
     };
-    match execute(cli, &mut io::stdout().lock()) {
+    // `watch` never writes to stdout; avoiding `io::stdout().lock()` keeps
+    // std's 1 KiB `LineWriter<StdoutRaw>` buffer out of the sleeping daemon's
+    // dirty `MALLOC_SMALL` pages.
+    let result = if matches!(cli.command, cli::Command::Watch) {
+        watch()
+    } else {
+        execute(cli, &mut io::stdout().lock())
+    };
+    match result {
         Ok(code) => code,
         Err(error) if error.is_stdout_closed() => ExitCode::SUCCESS,
         Err(error) => {
@@ -44,6 +63,27 @@ pub fn run() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn watch() -> Result<ExitCode, AppError> {
+    let (system, store) = environment()?;
+    let mut state_cache = store::StateCache::default();
+    loop {
+        // One failed pass must not stop the next; launchd keeps stderr.
+        if let Err(error) = report::watch_pass_cached(&system, &store, &mut state_cache) {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "pass failed: {}", error::diagnostic(&error));
+        }
+        system.sleep(WATCH_INTERVAL);
+    }
+}
+
+fn is_bare_watch_invocation() -> bool {
+    if std::env::var_os("AGENTWARDEN_FORMAT").is_some() {
+        return false;
+    }
+    let mut args = std::env::args_os();
+    args.next().is_some() && args.next().is_some_and(|arg| arg == "watch") && args.next().is_none()
 }
 
 fn execute(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
@@ -74,17 +114,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                 ExitCode::SUCCESS
             })
         }
-        cli::Command::Watch => {
-            let (system, store) = environment()?;
-            loop {
-                // One failed pass must not stop the next; launchd keeps stderr.
-                if let Err(error) = report::pass(&system, &store, true) {
-                    let mut stderr = io::stderr().lock();
-                    let _ = writeln!(stderr, "pass failed: {}", error::diagnostic(&error));
-                }
-                system.sleep(WATCH_INTERVAL);
-            }
-        }
+        cli::Command::Watch => watch(),
         cli::Command::Install { uninstall } => {
             let message = install(uninstall)?;
             output::line(stdout, &message)?;
@@ -94,8 +124,11 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
 }
 
 fn environment() -> Result<(impl System, Store), AppError> {
-    let system = platform::system()?;
-    Ok((system, Store::for_home(&platform::home()?)))
+    platform::check_available()?;
+    let home = platform::home()?;
+    let store = Store::for_home(&home);
+    let system = platform::system(home)?;
+    Ok((system, store))
 }
 
 #[cfg(target_os = "macos")]

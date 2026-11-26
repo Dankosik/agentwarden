@@ -1,11 +1,12 @@
 //! The rules: which processes to stop and when to restart Codex. Pure functions
 //! of a snapshot, its ownership and the remembered state.
 
+use compact_str::CompactString;
 use serde::Serialize;
 
 use crate::{
     model::{Identity, Pressure, Snapshot},
-    owners::{Ownership, is_shell},
+    owners::{Ownership, is_protected_process, is_shell},
     state::State,
 };
 
@@ -33,10 +34,20 @@ pub enum Rule {
     IdleCodexRestart,
 }
 
+impl Rule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Orphan => "orphan",
+            Self::IdleClaudeSession => "idle-claude-session",
+            Self::IdleCodexRestart => "idle-codex-restart",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Target {
     pub identity: Identity,
-    pub exe_name: String,
+    pub exe_name: CompactString,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -73,13 +84,86 @@ impl Action {
     }
 }
 
-pub fn plan(snapshot: &Snapshot, ownership: &Ownership<'_>, state: &State) -> Vec<Action> {
+fn idle_session_secs(
+    snapshot: &Snapshot,
+    ownership: &Ownership,
+    state: &State,
+    session_pid: i32,
+    now: u64,
+    window: u64,
+) -> Option<u64> {
+    let process = ownership.process(snapshot, session_pid)?;
+    let idle = state.session_idle_secs_for(process.pid, snapshot.started(process), now)?;
+    if idle < window {
+        return None;
+    }
+    // A running shell, however old, or anything started within the
+    // window means the session is working. A shell that runs a single
+    // command execs it, so a long command can be a direct child.
+    let busy = ownership.any_descendant(snapshot, session_pid, |child| {
+        is_shell(snapshot, child) || child.age_secs < window
+    });
+    (!busy).then_some(idle)
+}
+
+/// True when the orphan or idle-Claude rules would emit at least one stop
+/// action, so `watch` knows whether process footprints need to be sampled.
+pub fn has_stop_candidates(snapshot: &Snapshot, ownership: &Ownership, state: &State) -> bool {
+    if ownership
+        .orphans
+        .iter()
+        .any(|&root| !ownership.is_tree_protected(snapshot, root))
+    {
+        return true;
+    }
+    let pressure = state.effective_pressure(snapshot);
+    if let Some(window) = claude_idle_window_secs(pressure) {
+        let now = snapshot.taken_at;
+        for session in &ownership.claude_sessions {
+            if session.helpers.is_empty() {
+                continue;
+            }
+            if idle_session_secs(snapshot, ownership, state, session.pid, now, window).is_some()
+                && session
+                    .helpers
+                    .iter()
+                    .any(|&helper| !ownership.is_tree_protected(snapshot, helper))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// When the Codex app is running with no commands and outside its cooldown,
+/// returns the app's age in seconds so `watch` knows whether to query HID idle
+/// and Codex rollout activity.
+pub fn codex_eligible_for_idle_check(
+    snapshot: &Snapshot,
+    ownership: &Ownership,
+    state: &State,
+) -> Option<u64> {
+    let app = ownership.codex_app.as_ref()?;
+    let process = ownership.process(snapshot, app.pid)?;
+    // Without any Codex runtime, runtime footprint is guaranteed 0 (< 512 MiB).
+    if app.runtimes.is_empty() || !app.commands.is_empty() {
+        return None;
+    }
+    let recent_restart = state
+        .last_codex_restart_at
+        .is_some_and(|at| snapshot.taken_at.saturating_sub(at) < CODEX_RESTART_INTERVAL_SECS);
+    (!recent_restart).then_some(process.age_secs)
+}
+
+pub fn plan(snapshot: &Snapshot, ownership: &Ownership, state: &State) -> Vec<Action> {
     let now = snapshot.taken_at;
     let pressure = state.effective_pressure(snapshot);
     let mut actions = Vec::new();
 
     for root in &ownership.orphans {
         actions.extend(stop(
+            snapshot,
             ownership,
             *root,
             Rule::Orphan,
@@ -89,25 +173,17 @@ pub fn plan(snapshot: &Snapshot, ownership: &Ownership<'_>, state: &State) -> Ve
 
     if let Some(window) = claude_idle_window_secs(pressure) {
         for session in &ownership.claude_sessions {
-            let Some(process) = ownership.process(session.pid) else {
-                continue;
-            };
-            let Some(idle) = state.session_idle_secs(&process.identity(), now) else {
-                continue;
-            };
-            // A running shell, however old, or anything started within the
-            // window means the session is working. A shell that runs a single
-            // command execs it, so a long command can be a direct child.
-            let busy_shell = ownership
-                .descendants(session.pid)
-                .into_iter()
-                .filter_map(|pid| ownership.process(pid))
-                .any(|child| is_shell(child) || child.age_secs < window);
-            if idle < window || busy_shell {
+            if session.helpers.is_empty() {
                 continue;
             }
+            let Some(idle) =
+                idle_session_secs(snapshot, ownership, state, session.pid, now, window)
+            else {
+                continue;
+            };
             for helper in &session.helpers {
                 actions.extend(stop(
+                    snapshot,
                     ownership,
                     *helper,
                     Rule::IdleClaudeSession,
@@ -130,45 +206,51 @@ pub fn plan(snapshot: &Snapshot, ownership: &Ownership<'_>, state: &State) -> Ve
 
 fn codex_restart(
     snapshot: &Snapshot,
-    ownership: &Ownership<'_>,
+    ownership: &Ownership,
     state: &State,
     pressure: Pressure,
 ) -> Option<Action> {
     let now = snapshot.taken_at;
     let app = ownership.codex_app.as_ref()?;
-    let process = ownership.process(app.pid)?;
-    // A running command is work in progress however quiet it is.
-    if !app.commands.is_empty() {
+    let process = ownership.process(snapshot, app.pid)?;
+    // A running command is work in progress however quiet it is; without a
+    // Codex runtime there is no Codex footprint to reclaim.
+    if app.runtimes.is_empty() || !app.commands.is_empty() {
+        return None;
+    }
+    let recent_restart = state
+        .last_codex_restart_at
+        .is_some_and(|at| now.saturating_sub(at) < CODEX_RESTART_INTERVAL_SECS);
+    if recent_restart {
+        return None;
+    }
+    let user_idle = snapshot.user_idle_secs?;
+    if user_idle < USER_IDLE_SECS {
         return None;
     }
     let codex_idle = snapshot
         .codex_activity_at
         .map_or(process.age_secs, |at| now.saturating_sub(at));
-    let user_idle = snapshot.user_idle_secs?;
+    if codex_idle < CODEX_IDLE_SECS {
+        return None;
+    }
     let footprint: u64 = app
         .runtimes
         .iter()
-        .map(|runtime| ownership.tree_footprint(*runtime))
+        .map(|runtime| ownership.tree_footprint(snapshot, *runtime))
         .sum();
-    let recent_restart = state
-        .last_codex_restart_at
-        .is_some_and(|at| now.saturating_sub(at) < CODEX_RESTART_INTERVAL_SECS);
     let needed = if pressure >= Pressure::Warning {
         CODEX_WORTH_RESTART_BYTES / 2
     } else {
         CODEX_WORTH_RESTART_BYTES
     };
-    if codex_idle < CODEX_IDLE_SECS
-        || user_idle < USER_IDLE_SECS
-        || footprint < needed
-        || recent_restart
-    {
+    if footprint < needed {
         return None;
     }
     Some(Action::RestartCodex {
         rule: Rule::IdleCodexRestart,
-        app: target(process),
-        app_exe: process.exe.clone(),
+        app: target(snapshot, process),
+        app_exe: snapshot.exe(process).to_owned(),
         footprint_bytes: footprint,
         reason: format!(
             "Codex idle {} min, user idle {} min, Codex holds {} MB, {:?} pressure",
@@ -180,29 +262,40 @@ fn codex_restart(
     })
 }
 
-fn stop(ownership: &Ownership<'_>, root: i32, rule: Rule, reason: String) -> Option<Action> {
-    let process = ownership.process(root)?;
+fn stop(
+    snapshot: &Snapshot,
+    ownership: &Ownership,
+    root: i32,
+    rule: Rule,
+    reason: String,
+) -> Option<Action> {
+    let process = ownership.process(snapshot, root)?;
+    let tree = ownership.tree(snapshot, root);
     // A helper that started an agent, a shell or a terminal program is doing
     // someone's work; it is left alone with everything under it.
-    if std::iter::once(root)
-        .chain(ownership.descendants(root))
-        .any(|pid| ownership.is_protected(pid))
+    if tree
+        .iter()
+        .any(|member| is_protected_process(snapshot, member))
     {
         return None;
     }
+    let footprint_bytes = tree
+        .iter()
+        .filter_map(|member| member.footprint_bytes)
+        .sum();
     Some(Action::Stop {
         rule,
-        root: target(process),
-        tree: ownership.tree(root).into_iter().map(target).collect(),
-        footprint_bytes: ownership.tree_footprint(root),
+        root: target(snapshot, process),
+        tree: tree.into_iter().map(|p| target(snapshot, p)).collect(),
+        footprint_bytes,
         reason,
     })
 }
 
-fn target(process: &crate::model::Process) -> Target {
+fn target(snapshot: &Snapshot, process: &crate::model::Process) -> Target {
     Target {
-        identity: process.identity(),
-        exe_name: process.exe_name().to_owned(),
+        identity: snapshot.identity(process),
+        exe_name: CompactString::from(snapshot.exe_name(process)),
     }
 }
 
@@ -321,26 +414,28 @@ mod tests {
         assert!(!restarts(&busy, &state), "recent rollout write");
 
         let (mut shell, state) = codex_ready();
-        shell.processes.push(crate::owners::tests::proc(
+        crate::owners::tests::add_proc(
+            &mut shell,
             214,
             210,
             "/bin/zsh",
             "/bin/zsh -lc make",
             300,
             3,
-        ));
+        );
         assert!(!restarts(&shell, &state), "a command started 5 minutes ago");
 
         // `zsh -lc 'cargo test'` execs cargo; it has run, silent, for 2 hours.
         let (mut long, state) = codex_ready();
-        long.processes.push(crate::owners::tests::proc(
+        crate::owners::tests::add_proc(
+            &mut long,
             214,
             210,
             "/Users/u/.cargo/bin/cargo",
             "cargo test",
             7200,
             200,
-        ));
+        );
         assert!(!restarts(&long, &state), "a long silent command");
 
         let (mut present, state) = codex_ready();
@@ -376,22 +471,24 @@ mod tests {
     fn helper_trees_with_an_agent_shell_or_terminal_are_left_alone() {
         let mut snapshot = machine();
         // Orphan 400's worker runs a shell; a Claude helper has started a CLI agent.
-        snapshot.processes.push(crate::owners::tests::proc(
+        crate::owners::tests::add_proc(
+            &mut snapshot,
             405,
             401,
             "/bin/zsh",
             "zsh -c npm run dev",
             60,
             4,
-        ));
-        snapshot.processes.push(crate::owners::tests::proc(
+        );
+        crate::owners::tests::add_proc(
+            &mut snapshot,
             123,
             122,
             "/Users/u/.local/bin/claude",
             "claude -p review",
             5000,
             200,
-        ));
+        );
         snapshot.pressure = Pressure::Critical;
         let state = aged(&mut snapshot, 20 * 60);
         let ownership = Ownership::new(&snapshot, &state.known_helpers);
@@ -406,14 +503,15 @@ mod tests {
         let mut snapshot = machine();
         snapshot.pressure = Pressure::Warning;
         // A command the session started 20 minutes ago, exec'd without a shell.
-        snapshot.processes.push(crate::owners::tests::proc(
+        crate::owners::tests::add_proc(
+            &mut snapshot,
             124,
             120,
             "/Users/u/.cargo/bin/cargo",
             "cargo build",
             20 * 60,
             300,
-        ));
+        );
         let mut state = aged(&mut snapshot, 61 * 60);
         state.known_helpers.clear();
         let ownership = Ownership::new(&snapshot, &state.known_helpers);
