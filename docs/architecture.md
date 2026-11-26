@@ -13,15 +13,15 @@ contract; this file owns where each responsibility lives.
 | `src/main.rs` | Thin executable entry point |
 | `src/lib.rs` | Argument parsing, dispatch, the watch loop, final exit status |
 | `src/cli.rs` | Commands, flags, help, and the source for completions |
-| `src/platform.rs` | Every macOS call behind the `System` trait: `ps`, `top`, `sysctl`, `ioreg`, `launchctl`, signals, `open`, and the LaunchAgent install |
-| `src/probe.rs` | Pure parsers for those commands' output and for the agents' MCP configuration |
-| `src/model.rs` | The snapshot: processes, pressure, swap, idle time, Codex activity, MCP server signatures |
-| `src/owners.rs` | Ownership tree: Claude Code sessions and their helpers, Codex runtimes and the app, orphans |
-| `src/state.rs` | What passes remember: known helpers, session CPU activity, last swap, last Codex restart |
-| `src/rules.rs` | The rules and their constants, as pure functions of snapshot, ownership and state |
-| `src/actions.rs` | Revalidation, signalling, the Codex restart sequence, and the `System` trait |
-| `src/store.rs` | State file and the bounded action log |
-| `src/report.rs` | One pass (`pass`) and the report it prints |
+| `src/platform.rs` | Every macOS call behind the `System` trait: `ps`, `top`, `sysctl`, `ioreg`, `launchctl`, read-only `sqlite3`, signals, `open`, MCP config/plugin discovery, per-`--app_data_dir` activity probes, watch caches, and the LaunchAgent install |
+| `src/probe.rs` | Pure parsers for those commands' output (`ps`, `tty_id`, `top`, `sysctl`, `ioreg`, `launchctl`) and for agent MCP configurations (TOML, JSON/JSONC, OpenCode) |
+| `src/model.rs` | The snapshot: processes (with compact `StrSpan` arena and `tty_id`), `AgentKind`, `SessionMode`, pressure, swap, idle time, per-agent activity maps, MCP `ServerSignature` matching (including package runners) |
+| `src/owners.rs` | Dynamic ownership tree: Claude Code sessions, desktop apps (Codex, Antigravity and renamed clones, OpenCode, and generic MCP-hosting `other` IDEs), CLI/service/subagent sessions, inherited-TTY safety checks, and orphans (including `sidecar_sdk`, orphaned desktop `language_server`, and childless `opencode-pty`) |
+| `src/state.rs` | What passes remember: known helpers, Claude session CPU activity, last swap, per-bundle app restart timestamps, and pending late-quit relaunches |
+| `src/rules.rs` | The 6 rules (`orphan`, `idle-claude-session`, `idle-codex-restart`, `idle-antigravity-restart`, `idle-opencode-restart`, `idle-opencode-service`), lazy `IdleProbeNeeds`, and constants, as pure functions of snapshot, ownership and state |
+| `src/actions.rs` | Revalidation, `Stop`, `StopGraceful`, desktop app restart sequences (`RestartCodex`, `RestartApp`), and the `System` trait |
+| `src/store.rs` | State file, stamp-validated state cache, and the bounded action log |
+| `src/report.rs` | One pass (`pass`), lazy watch pass (`watch_pass_cached`), and text/JSON report rendering |
 | `src/install.rs` | The LaunchAgent property list |
 | `src/output.rs` | Text or JSON on stdout, and output-write failures |
 | `src/error.rs` | Error types and diagnostic rendering |
@@ -31,16 +31,24 @@ contract; this file owns where each responsibility lives.
 
 ## Data flow
 
-1. `platform` builds a `Snapshot`. Commands that fail fatally (`ps`, `top`)
-   abort the pass; optional signals (pressure, swap, idle, launchd jobs)
-   degrade to defaults that make rules more conservative.
-2. `owners` turns the flat process list into owners. Agent hosts are never
-   targets.
+1. `platform` builds a `Snapshot` via `begin_pass` (streaming `ps` + `sysctl`,
+   plus lazy/cached `launchctl` and targeted `ps -o args=`). A `/bin/ps`
+   failure aborts the pass; optional signals (pressure, swap, HID idle, launchd
+   jobs, disk/SQLite activity) degrade to defaults that make rules more
+   conservative. In `watch` and `reclaim`, `/usr/bin/top` footprint probes run
+   only when needed and degrade non-fatally so stop rules and session
+   observation keep running while footprint-gated restarts conservatively skip.
+2. `owners` turns the flat process list into owners: dynamically discovered
+   desktop apps (including renamed clones), standalone CLI/service/subagent
+   sessions, generic `other` MCP hosts, and verified orphans. Agent hosts are
+   never `Stop` targets (aside from provably orphaned desktop Antigravity
+   `language_server`s).
 3. `rules::plan` reads the snapshot, ownership and the previous state, and
    returns actions. It has no side effects.
 4. `actions::execute` revalidates each target by PID and start time and acts.
-5. `state.observe` records this pass; `store` saves state atomically and
-   appends the action records.
+5. `state.observe` records this pass (including `known_helpers` across all
+   discovered agents); `store` saves state atomically when changed and appends
+   the action records.
 
 `status` and `reclaim --dry-run` stop after step 3 and write nothing.
 

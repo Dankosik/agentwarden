@@ -140,12 +140,42 @@ pub fn pack_lstart(lstart: [&str; 5]) -> Option<u32> {
     Some((((((year * 12 + month) * 31 + day) * 24 + hour) * 60 + min) * 60) + sec)
 }
 
+/// Encode macOS `ps -o tty=` column into a compact `u16` identifier:
+/// - `""` or starting with `'?'` (`??`) -> `0` (no controlling terminal)
+/// - `ttysNNN` (`sNNN` on truncated displays) -> `0x8000 | (NNN & 0x7FFF)` (bijective for 0..=32767)
+/// - `console` -> `1`
+/// - any other TTY name -> deterministic non-zero hash in `2..0x8000`.
+pub fn parse_tty_id(tty: &str) -> u16 {
+    if tty.is_empty() || tty.starts_with('?') {
+        return 0;
+    }
+    if tty == "console" {
+        return 1;
+    }
+    if let Some(num_str) = tty.strip_prefix("ttys").or_else(|| tty.strip_prefix('s'))
+        && !num_str.is_empty()
+        && num_str.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(num) = num_str.parse::<u16>()
+        && num < 0x8000
+    {
+        return 0x8000 | num;
+    }
+    let mut h: u32 = 2_166_136_261;
+    for &b in tty.as_bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(16_777_619);
+    }
+    let folded = ((h ^ (h >> 16)) & 0x7FFF) as u16;
+    if folded < 2 { folded + 2 } else { folded }
+}
+
 /// One parsed row from `ps -axww -o pid=,ppid=,uid=,tty=,state=,time=,etime=,lstart=,comm=`.
 pub struct ParsedPsLine<'a> {
     pub pid: i32,
     pub ppid: i32,
     pub uid: u32,
     pub has_tty: bool,
+    pub tty_id: u16,
     pub zombie: bool,
     pub cpu_centis: u64,
     pub age_secs: u64,
@@ -170,12 +200,14 @@ fn parse_ps_prefix(mut rest: &str) -> Option<(ParsedPsLine<'_>, &str)> {
     if !is_lstart_hms(w3) || !is_lstart_year(w4) {
         return None;
     }
+    let tty_id = parse_tty_id(tty);
     Some((
         ParsedPsLine {
             pid,
             ppid,
             uid,
-            has_tty: !tty.starts_with('?'),
+            has_tty: tty_id != 0,
+            tty_id,
             zombie: state.starts_with('Z'),
             cpu_centis: clock_centis(time)?,
             age_secs: clock_centis(etime)? / 100,
@@ -253,13 +285,13 @@ pub fn ps_processes(text: &str, user: Option<u32>) -> Option<crate::model::Snaps
         }
         let [w0, w1, w2, w3, w4] = row.lstart;
         let started_owned = join_five(w0, w1, w2, w3, w4);
-        snapshot.push_process(
+        snapshot.push_process_with_tty(
             row.pid,
             row.ppid,
             row.uid,
             &started_owned,
             row.age_secs,
-            row.has_tty,
+            row.tty_id,
             row.cpu_centis,
             None,
             row.exe,
@@ -785,14 +817,16 @@ struct TomlParser<R> {
     reader: StackReader<R, 4096>,
     mcp_root_state: TableState,
     servers: Vec<PartialServer>,
+    project_paths: Option<Vec<String>>,
 }
 
 impl<R: Read> TomlParser<R> {
-    fn new(inner: R) -> Self {
+    fn new(inner: R, collect_projects: bool) -> Self {
         Self {
             reader: StackReader::new(inner),
             mcp_root_state: TableState::Implicit,
             servers: Vec::new(),
+            project_paths: collect_projects.then(Vec::new),
         }
     }
 
@@ -1262,6 +1296,26 @@ impl<R: Read> TomlParser<R> {
             TomlScope::Root => {
                 let mut seg0 = StrSink::stack();
                 self.parse_key_segment(&mut seg0)?;
+                if seg0.as_stack_bytes() == Some(b"projects")
+                    && is_header
+                    && self.project_paths.is_some()
+                {
+                    self.skip_hspace()?;
+                    if self.reader.peek()? == Some(b'.') {
+                        self.reader.consume();
+                        let mut project = CompactString::default();
+                        self.parse_key_segment(&mut StrSink::Collect(&mut project))?;
+                        if let Some(paths) = self.project_paths.as_mut()
+                            && paths.len() < MAX_DISCOVERED_PATHS
+                            && project.starts_with('/')
+                            && !paths.iter().any(|existing| existing == project.as_str())
+                        {
+                            paths.push(project.to_string());
+                        }
+                        self.skip_rest_of_key_path()?;
+                    }
+                    return Ok(TomlKeyTarget::Ignore);
+                }
                 if seg0.as_stack_bytes() != Some(b"mcp_servers") {
                     self.skip_rest_of_key_path()?;
                     return Ok(TomlKeyTarget::Ignore);
@@ -1515,7 +1569,7 @@ impl<R: Read> TomlParser<R> {
         }
     }
 
-    fn parse_document(mut self) -> Result<Vec<ServerSignature>, ()> {
+    fn parse_document(mut self) -> Result<(Vec<ServerSignature>, Vec<String>), ()> {
         // Optional UTF-8 BOM at the beginning of the file.
         if self.reader.peek()? == Some(0xEF) {
             self.reader.consume();
@@ -1583,7 +1637,10 @@ impl<R: Read> TomlParser<R> {
                 })
             })
             .collect();
-        Ok(dedup_signatures(collected))
+        Ok((
+            dedup_signatures(collected),
+            self.project_paths.unwrap_or_default(),
+        ))
     }
 }
 
@@ -1800,7 +1857,17 @@ fn validate_toml_bare_scalar(bytes: &[u8]) -> bool {
 /// Stream stdio servers directly from `~/.codex/config.toml` using a fixed stack
 /// buffer without allocating `BufReader`, an extracted TOML slice, or an AST.
 pub fn codex_servers_from_reader(reader: impl Read) -> Vec<ServerSignature> {
-    TomlParser::new(reader).parse_document().unwrap_or_default()
+    TomlParser::new(reader, false)
+        .parse_document()
+        .map_or_default(|(servers, _)| servers)
+}
+
+/// Stream stdio servers and `[projects."<path>"]` keys from `~/.codex/config.toml`
+/// in a single pass.
+pub fn codex_config_from_reader(reader: impl Read) -> (Vec<ServerSignature>, Vec<String>) {
+    TomlParser::new(reader, true)
+        .parse_document()
+        .unwrap_or_default()
 }
 
 /// Stdio servers in `~/.codex/config.toml`; servers with a URL are skipped.
@@ -1813,16 +1880,21 @@ pub fn codex_servers(text: &str) -> Vec<ServerSignature> {
 // Streaming RFC 8259 JSON extractor for `~/.claude.json`
 // ---------------------------------------------------------------------------
 
+const MAX_DISCOVERED_PATHS: usize = 256;
+const MAX_AUX_CONFIG_BYTES: usize = 2 << 20;
+
 struct JsonParser<R> {
     reader: StackReader<R, 4096>,
     servers: Vec<ServerSignature>,
+    project_paths: Option<Vec<String>>,
 }
 
 impl<R: Read> JsonParser<R> {
-    fn new(inner: R) -> Self {
+    fn new(inner: R, collect_projects: bool) -> Self {
         Self {
             reader: StackReader::new(inner),
             servers: Vec::new(),
+            project_paths: collect_projects.then(Vec::new),
         }
     }
 
@@ -2177,6 +2249,13 @@ impl<R: Read> JsonParser<R> {
         loop {
             key_buf.clear();
             self.parse_string(&mut StrSink::Collect(&mut key_buf))?;
+            if let Some(paths) = self.project_paths.as_mut()
+                && paths.len() < MAX_DISCOVERED_PATHS
+                && key_buf.starts_with('/')
+                && !paths.iter().any(|existing| existing == key_buf.as_str())
+            {
+                paths.push(key_buf.to_string());
+            }
             self.skip_ws()?;
             self.reader.expect(b':')?;
             self.skip_ws()?;
@@ -2204,7 +2283,7 @@ impl<R: Read> JsonParser<R> {
         Ok(())
     }
 
-    fn parse_root(mut self) -> Result<Vec<ServerSignature>, ()> {
+    fn parse_root(mut self) -> Result<(Vec<ServerSignature>, Vec<String>), ()> {
         self.skip_ws()?;
         self.reader.expect(b'{')?;
         self.skip_ws()?;
@@ -2250,21 +2329,288 @@ impl<R: Read> JsonParser<R> {
         if self.reader.peek()?.is_some() {
             return Err(());
         }
-        Ok(dedup_signatures(self.servers))
+        Ok((
+            dedup_signatures(self.servers),
+            self.project_paths.unwrap_or_default(),
+        ))
     }
 }
 
 /// Stream stdio servers directly from a `~/.claude.json` reader using a fixed
 /// stack buffer without allocating `BufReader` or scratch buffers for skipped
 /// fields.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn claude_servers_from_reader(reader: impl Read) -> Vec<ServerSignature> {
-    JsonParser::new(reader).parse_root().unwrap_or_default()
+    JsonParser::new(reader, false)
+        .parse_root()
+        .map_or_default(|(servers, _)| servers)
+}
+
+/// Stream stdio servers and project directory paths from `~/.claude.json` in a
+/// single pass.
+pub fn claude_config_from_reader(reader: impl Read) -> (Vec<ServerSignature>, Vec<String>) {
+    JsonParser::new(reader, true)
+        .parse_root()
+        .unwrap_or_default()
 }
 
 /// Stdio servers in `~/.claude.json`, user scope and every project scope.
 #[cfg(test)]
 pub fn claude_servers(text: &str) -> Vec<ServerSignature> {
     claude_servers_from_reader(io::Cursor::new(text.as_bytes()))
+}
+
+fn read_bounded_utf8(reader: impl Read, limit: usize) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take((limit as u64).saturating_add(1));
+    limited.read_to_end(&mut bytes).ok()?;
+    if bytes.len() > limit {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Strip JSONC `//` line comments, `/* ... */` block comments, and trailing
+/// commas before `}` or `]` while preserving string literals verbatim.
+fn strip_jsonc(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b);
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 1;
+                out.push(bytes[i]);
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+
+    // Remove trailing commas immediately preceding `}` or `]`.
+    let mut cleaned = Vec::with_capacity(out.len());
+    let mut j = 0usize;
+    in_string = false;
+    while j < out.len() {
+        let b = out[j];
+        if in_string {
+            cleaned.push(b);
+            if b == b'\\' && j + 1 < out.len() {
+                j += 1;
+                cleaned.push(out[j]);
+            } else if b == b'"' {
+                in_string = false;
+            }
+            j += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            cleaned.push(b);
+            j += 1;
+            continue;
+        }
+        if b == b',' {
+            let mut k = j + 1;
+            while k < out.len() && out[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < out.len() && matches!(out[k], b'}' | b']') {
+                j += 1;
+                continue;
+            }
+        }
+        cleaned.push(b);
+        j += 1;
+    }
+    String::from_utf8(cleaned).unwrap_or_default()
+}
+
+fn extract_json_server_entry(value: &serde_json::Value) -> Option<ServerSignature> {
+    let obj = value.as_object()?;
+    let cmd_val = obj.get("command")?;
+    match cmd_val {
+        serde_json::Value::String(cmd) if !cmd.is_empty() => {
+            let mut args = SmallVec::new();
+            if let Some(arr) = obj.get("args").and_then(serde_json::Value::as_array) {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        args.push(CompactString::from(s));
+                    }
+                }
+            }
+            Some(ServerSignature {
+                command: CompactString::from(cmd.as_str()),
+                args,
+            })
+        }
+        serde_json::Value::Array(items) => {
+            let mut iter = items.iter().filter_map(serde_json::Value::as_str);
+            let cmd = iter.next().filter(|s| !s.is_empty())?;
+            let args = iter.map(CompactString::from).collect();
+            Some(ServerSignature {
+                command: CompactString::from(cmd),
+                args,
+            })
+        }
+        serde_json::Value::Object(cmd_obj) => {
+            let path = cmd_obj
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let mut args = SmallVec::new();
+            if let Some(arr) = cmd_obj.get("args").and_then(serde_json::Value::as_array) {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        args.push(CompactString::from(s));
+                    }
+                }
+            }
+            Some(ServerSignature {
+                command: CompactString::from(path),
+                args,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn collect_server_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+    out: &mut Vec<ServerSignature>,
+    depth: u8,
+) {
+    for (key, value) in map {
+        if let Some(sig) = extract_json_server_entry(value) {
+            out.push(sig);
+        } else if depth > 0
+            && matches!(key.as_str(), "servers" | "mcpServers")
+            && let Some(nested) = value.as_object()
+        {
+            collect_server_map(nested, out, depth - 1);
+        }
+    }
+}
+
+/// Extract stdio MCP servers from standard JSON/JSONC MCP config files:
+/// Antigravity (`~/.gemini/antigravity/mcp_config.json`), Claude Desktop
+/// (`claude_desktop_config.json`), VS Code (`mcp.json` with `"servers"`),
+/// Cursor/Windsurf, project `.mcp.json`, and Claude/Codex/Gemini plugin
+/// `.mcp.json` (which may use `{"mcpServers": {...}}`, `{"servers": {...}}`, or
+/// flat `{"serverName": {"command": ..., "args": [...]}}`).
+pub fn mcp_json_servers_from_reader(reader: impl Read) -> Vec<ServerSignature> {
+    let Some(raw) = read_bounded_utf8(reader, MAX_AUX_CONFIG_BYTES) else {
+        return Vec::new();
+    };
+    let text = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+    let parsed = serde_json::from_str::<serde_json::Value>(text)
+        .or_else(|_| serde_json::from_str::<serde_json::Value>(&strip_jsonc(text)));
+    let Ok(serde_json::Value::Object(root)) = parsed else {
+        return Vec::new();
+    };
+    let mut servers = Vec::new();
+    if let Some(map) = root
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+    {
+        collect_server_map(map, &mut servers, 1);
+    } else if let Some(map) = root.get("mcp").and_then(serde_json::Value::as_object) {
+        collect_server_map(map, &mut servers, 1);
+    } else {
+        // Flat plugin `.mcp.json` or VS Code `{"servers": {...}}`.
+        collect_server_map(&root, &mut servers, 1);
+    }
+    dedup_signatures(servers)
+}
+
+/// Extract local stdio MCP servers from scoped JSON/JSONC settings files:
+/// OpenCode (`opencode.json`/`opencode.jsonc` `"mcp"`), Gemini CLI / Antigravity
+/// (`settings.json` `"mcpServers"`), plugin manifests (`plugin.json`), and Zed
+/// (`~/.config/zed/settings.json` `"context_servers"`). Ignores unrelated keys
+/// such as `"hooks"`.
+pub fn opencode_servers_from_reader(reader: impl Read) -> Vec<ServerSignature> {
+    let Some(raw) = read_bounded_utf8(reader, MAX_AUX_CONFIG_BYTES) else {
+        return Vec::new();
+    };
+    let text = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+    let cleaned = strip_jsonc(text);
+    let Ok(serde_json::Value::Object(root)) = serde_json::from_str(&cleaned) else {
+        return Vec::new();
+    };
+    let mut servers = Vec::new();
+    for key in ["mcp", "mcpServers", "context_servers"] {
+        if let Some(map) = root.get(key).and_then(serde_json::Value::as_object) {
+            collect_server_map(map, &mut servers, 1);
+        }
+    }
+    dedup_signatures(servers)
+}
+
+/// Extract project directory paths from `[projects."<path>"]` in `~/.codex/config.toml`.
+#[cfg(test)]
+pub fn codex_project_paths_from_reader(reader: impl Read) -> Vec<String> {
+    codex_config_from_reader(reader).1
+}
+
+/// Extract installed plugin directories from `~/.claude/plugins/installed_plugins.json`.
+pub fn claude_installed_plugin_paths_from_reader(reader: impl Read) -> Vec<String> {
+    let Some(text) = read_bounded_utf8(reader, MAX_AUX_CONFIG_BYTES) else {
+        return Vec::new();
+    };
+    let Ok(serde_json::Value::Object(root)) = serde_json::from_str(&text) else {
+        return Vec::new();
+    };
+    let Some(plugins) = root.get("plugins").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for entries in plugins.values() {
+        let Some(arr) = entries.as_array() else {
+            continue;
+        };
+        for entry in arr {
+            if paths.len() >= MAX_DISCOVERED_PATHS {
+                return paths;
+            }
+            if let Some(path) = entry.get("installPath").and_then(serde_json::Value::as_str)
+                && path.starts_with('/')
+                && !paths.iter().any(|existing| existing == path)
+            {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    paths
 }
 
 pub fn dedup_signatures(mut signatures: Vec<ServerSignature>) -> Vec<ServerSignature> {
@@ -2907,5 +3253,154 @@ inline_srv = { command = \"codegraph\", args = [\"serve\", \"--mcp\"] }
                 "JsonParser accepted duplicate struct field: {dup_field}"
             );
         }
+    }
+
+    #[test]
+    fn extra_mcp_configs_parse_antigravity_opencode_plugins_and_projects() {
+        // Antigravity mcp_config.json + project .mcp.json (`mcpServers` wrapper).
+        let antigravity = r#"{
+            "mcpServers": {
+                "codegraph": { "command": "/Users/u/.local/bin/codegraph", "args": ["serve", "--mcp"] },
+                "remote": { "url": "https://example.invalid/mcp" }
+            }
+        }"#;
+        assert_eq!(
+            mcp_json_servers_from_reader(io::Cursor::new(antigravity.as_bytes())),
+            [ServerSignature {
+                command: "/Users/u/.local/bin/codegraph".into(),
+                args: smallvec!["serve".into(), "--mcp".into()],
+            }]
+        );
+
+        // Flat Claude plugin .mcp.json (no `mcpServers` wrapper).
+        let flat_plugin = r#"{
+            "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp@latest"] },
+            "http_only": { "type": "http", "url": "https://example.invalid" }
+        }"#;
+        assert_eq!(
+            mcp_json_servers_from_reader(io::Cursor::new(flat_plugin.as_bytes())),
+            [ServerSignature {
+                command: "npx".into(),
+                args: smallvec!["-y".into(), "@playwright/mcp@latest".into()],
+            }]
+        );
+
+        // OpenCode opencode.jsonc with comments, trailing commas, command array,
+        // and nested `"mcp": { "servers": { ... } }` map.
+        let opencode = r#"{
+            // OpenCode MCP config
+            "mcp": {
+                "railway": { "type": "local", "command": ["railway", "mcp"], "enabled": true, },
+                /* remote server */
+                "context7": { "type": "remote", "url": "https://mcp.example.invalid/not//comment" },
+                "custom": { "command": "mcp-grafana", "args": ["--disable-write"], },
+                "servers": {
+                    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"] },
+                },
+            },
+        }"#;
+        assert_eq!(
+            opencode_servers_from_reader(io::Cursor::new(opencode.as_bytes())),
+            [
+                ServerSignature {
+                    command: "codegraph".into(),
+                    args: smallvec!["serve".into(), "--mcp".into()],
+                },
+                ServerSignature {
+                    command: "mcp-grafana".into(),
+                    args: smallvec!["--disable-write".into()],
+                },
+                ServerSignature {
+                    command: "railway".into(),
+                    args: smallvec!["mcp".into()],
+                },
+            ]
+        );
+
+        // JSONC comments / trailing commas in project `.mcp.json` or Gemini `settings.json`.
+        let jsonc_mcp = r#"{
+            // comment
+            "mcpServers": {
+                "creative": { "command": "node", "args": ["./mcp/server.bundle.mjs",], },
+            },
+        }"#;
+        assert_eq!(
+            mcp_json_servers_from_reader(io::Cursor::new(jsonc_mcp.as_bytes())),
+            [ServerSignature {
+                command: "node".into(),
+                args: smallvec!["./mcp/server.bundle.mjs".into()],
+            }]
+        );
+
+        // Claude config extracts both servers and project paths in one pass.
+        let claude = r#"{
+            "mcpServers": { "r": { "command": "railway", "args": ["mcp"] } },
+            "projects": {
+                "/Users/u/proj-a": { "mcpServers": {} },
+                "/Users/u/proj-b": { "mcpServers": { "g": { "command": "gopls", "args": ["mcp"] } } }
+            }
+        }"#;
+        let (servers, projects) = claude_config_from_reader(io::Cursor::new(claude.as_bytes()));
+        assert_eq!(servers.len(), 2);
+        assert_eq!(projects, ["/Users/u/proj-a", "/Users/u/proj-b"]);
+
+        // Codex single-pass config extraction (both mcp_servers and projects).
+        let codex_toml = "[mcp_servers.r]\ncommand = \"railway\"\nargs = [\"mcp\"]\n[projects.\"/Users/u/repo1\"]\ntrust_level = \"trusted\"\n[projects.\"/Users/u/repo2\"]\ntrust_level = \"trusted\"\n";
+        let (codex_srvs, mut codex_projects) =
+            codex_config_from_reader(io::Cursor::new(codex_toml.as_bytes()));
+        assert_eq!(codex_srvs.len(), 1);
+        assert_eq!(codex_srvs[0].command, "railway");
+        codex_projects.sort();
+        assert_eq!(codex_projects, ["/Users/u/repo1", "/Users/u/repo2"]);
+        assert_eq!(
+            codex_project_paths_from_reader(io::Cursor::new(codex_toml.as_bytes())).len(),
+            2
+        );
+
+        let installed = r#"{
+            "version": 2,
+            "plugins": {
+                "p@m": [{ "scope": "user", "installPath": "/Users/u/.claude/plugins/cache/p/1.0" }]
+            }
+        }"#;
+        assert_eq!(
+            claude_installed_plugin_paths_from_reader(io::Cursor::new(installed.as_bytes())),
+            ["/Users/u/.claude/plugins/cache/p/1.0"]
+        );
+        // Zed `settings.json` (`context_servers` with object `command: {path, args}`) and VS Code `mcp.json` (`servers`) with BOM.
+        let zed = "\u{feff}{\n  // Zed MCP config\n  \"context_servers\": {\n    \"pw\": { \"command\": { \"path\": \"npx\", \"args\": [\"-y\", \"@playwright/mcp@latest\"] } },\n  }\n}";
+        assert_eq!(
+            opencode_servers_from_reader(io::Cursor::new(zed.as_bytes())),
+            [ServerSignature {
+                command: "npx".into(),
+                args: smallvec!["-y".into(), "@playwright/mcp@latest".into()],
+            }]
+        );
+        let vscode = "\u{feff}{\"servers\":{\"r\":{\"type\":\"stdio\",\"command\":\"railway\",\"args\":[\"mcp\"]}}}";
+        assert_eq!(
+            mcp_json_servers_from_reader(io::Cursor::new(vscode.as_bytes())),
+            [ServerSignature {
+                command: "railway".into(),
+                args: smallvec!["mcp".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_tty_id_distinguishes_controlling_terminals() {
+        assert_eq!(super::parse_tty_id("??"), 0);
+        assert_eq!(super::parse_tty_id("?"), 0);
+        assert_eq!(super::parse_tty_id(""), 0);
+        assert_eq!(super::parse_tty_id("console"), 1);
+        let t0 = super::parse_tty_id("ttys000");
+        let t1 = super::parse_tty_id("ttys001");
+        let t2 = super::parse_tty_id("ttys002");
+        assert_ne!(t0, 0);
+        assert_ne!(t0, t1);
+        assert_ne!(t1, t2);
+        assert_eq!(t1, super::parse_tty_id("s001"));
+        assert_ne!(t1, super::parse_tty_id("s+1"));
+        assert_ne!(super::parse_tty_id("ttyp0"), 0);
+        assert_ne!(super::parse_tty_id("ttyp0"), 1);
     }
 }

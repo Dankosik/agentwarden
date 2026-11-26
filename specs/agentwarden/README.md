@@ -1,18 +1,22 @@
 # agentwarden: specification
 
-Status: definition; research gates closed (see [research](research.md)).
-Date: 2026-10-06. Scope narrowed the same day to memory held by agent helper
-processes; build admission and build-cache reclamation moved out (see
-[Out of scope](#out-of-scope)). No product code exists yet; the `stats` example
-from the template is still in place.
+Status: active specification; implemented on macOS (see [research](research.md)).
+Date: 2026-10-06 (expanded 2026-11-26 for dynamic multi-agent discovery,
+Antigravity and clones, OpenCode, nested subagents, and terminal Claude CLI).
+Scope is focused on memory held by agent helper processes; build admission and
+build-cache reclamation remain [out of scope](#out-of-scope).
 
 ## Problem
 
-A macOS workstation that runs several AI coding agents in parallel (Codex
-desktop, Claude Code desktop and CLI) runs out of memory over a working day
-until everything crawls. Every agent session starts its own copy of every
-configured stdio MCP server and keeps it for the session's lifetime. The
-desktop apps keep many sessions loaded, and some leak copies after sessions
+A macOS workstation that runs several AI coding agents in parallel — Claude Code
+(desktop and CLI), Codex (ChatGPT/Codex desktop apps, clones, CLI, `codex exec`,
+and nested subagents), Antigravity (standard or renamed/proxy-wrapped clones
+such as `Antigravity US.app`, and `agy` CLI), OpenCode (desktop app, CLI, and
+detached background service), and other MCP-capable IDEs/CLIs (Cursor, Windsurf,
+Zed, Gemini CLI, Cline) — runs out of memory over a working day until everything
+crawls. Every agent session starts its own copy of configured stdio MCP servers
+and runtime helpers and keeps them for the session's lifetime. Desktop apps keep
+many sessions loaded, and some leak copies or sidecars after sessions or apps
 end, so copies multiply into swap.
 
 ### Evidence from the owner's machine (2026-10-06)
@@ -111,12 +115,26 @@ Moved out on 2026-10-06 by the owner's decision:
 Each rule is on by default and needs no input. A rule fires only when the
 process passes the [safety contract](#safety-contract).
 
+Desktop agent apps (including arbitrarily renamed or proxy-wrapped clones such
+as `Antigravity US.app`, `Codex.app`, or custom bundles) are discovered
+dynamically by walking up from live bundled runtimes to their enclosing `.app`
+bundle rather than hardcoding bundle paths. Any other running IDE or CLI
+(Cursor, Windsurf, Zed, Gemini CLI, Cline, Claude Desktop direct MCPs, or future
+tools) that parents configured MCP servers is also dynamically discovered as
+`other` (or `claude` for Claude Desktop) so its MCP helpers are observed and
+recorded in `known_helpers` for orphan reaping after exit, while conservatively
+never stopping live helpers or restarting tools whose restart semantics are
+unproven.
+
 | Rule | Target | When | Why it is safe |
 | --- | --- | --- | --- |
-| Orphan | A helper process whose agent parent has exited (PPID 1): one seen serving a live agent, or one whose command line matches a configured MCP server with a specific program and arguments (a generic launcher such as `node` or `npx` alone is not evidence) | Older than a short grace period, and only while launchd's job list is readable | No session can use it again |
-| Idle Claude session | Every MCP server child of a Claude Code session whose own CPU time has not grown for the idle window, that started no process in it, and that runs no shell | Idle window chosen by pressure (below) | Claude Code restarts a stopped server on the next tool call (R1, observed twice) |
-| Codex leak | Codex app-server MCP children | Never stopped one by one | Codex reports a stopped server as "not connected" in that thread (R1) |
-| Idle Codex restart | The ChatGPT app that hosts Codex, restarted as a whole | All [conditions](#idle-codex-restart) hold | Saved threads persist on disk; restarting frees every pool the app leaked (swap 23.3 → 5.1 GB observed) |
+| `orphan` | A helper process whose agent parent has exited (PPID 1), with its descendants (excluding VCS/system utilities such as `git`, `ssh`, `gpg`): one previously seen serving a live agent (`known_helpers`), one whose command line matches a distinctive configured MCP server, an orphaned Antigravity `sidecar_sdk`, an orphaned desktop-bundled Antigravity `language_server` with `--host_bridge_url=`, or a childless `opencode-pty` when no OpenCode app/CLI/service is alive | Older than 120 s, and only while launchd's job list is readable | No live session can use it again |
+| `idle-claude-session` | Every MCP server child tree of a Claude Code session (desktop or terminal CLI) whose own CPU time has not grown beyond timer noise for the idle window, that started no process in it, and that runs no shell, nested external agent, or non-helper terminal command. Under a TTY-attached `claude` CLI session, only direct children matching configured MCP pool signatures on the exact inherited controlling TTY (and their non-shell, non-agent, same-TTY workers) qualify | Idle window chosen by pressure (below) | Claude Code restarts a stopped stdio MCP server on the next tool call (R1, observed twice); terminal `claude` CLI spawns stdio MCP servers over pipes/sockets while inheriting the parent TTY |
+| `idle-codex-restart` | Any desktop app hosting a bundled Codex runtime (`ChatGPT.app`, `Codex.app`, or clones), quit gracefully and relaunched via its exact bundle | All [idle desktop restart conditions](#idle-codex-restart) hold | Codex reports individually killed MCP servers as "not connected" (R1); saved threads persist on disk and restarting frees every leaked pool (swap 23.3 → 5.1 GB observed) |
+| `idle-antigravity-restart` | Any desktop app hosting Antigravity's `language_server` (`Antigravity.app`, `Antigravity US.app`, or arbitrarily renamed clones), quit gracefully (plus graceful SIGTERM to `language_server` if it lingers) and relaunched via its exact bundle | All [idle desktop restart conditions](#idle-codex-restart) hold, tracking each instance's `--app_data_dir` (`~/.gemini/<name>`, default `antigravity`) independently | Conversations persist on disk; restarting frees leaked renderers, `language_server`, sidecars, and MCP pools |
+| `idle-opencode-restart` | An idle OpenCode desktop app (and its detached `opencode-cli serve --service` only when no external CLI client is open), quit gracefully and relaunched via its exact bundle | All [idle desktop restart conditions](#idle-codex-restart) hold, using real SQLite session/message timestamps (`opencode.db`) + `prompt-history.jsonl` | Sessions persist in SQLite; SIGTERM-only shutdown preserves WAL integrity |
+| `idle-opencode-service` | A headless `opencode-cli serve --service` daemon when no OpenCode desktop app or CLI client is running (SIGTERM only, never SIGKILL) | Idle 60 min under Warning / 15 min under Critical (or 30 min idle + user away 30 min + ≥ 1 GB under Normal), with no running commands/shells/TTY/nested agents | OpenCode restarts the service on demand; SIGTERM-only preserves the SQLite database |
+| Live Codex / Antigravity / OpenCode / `other` MCP helpers one by one | Never | Never stopped while their parent is alive | Those agents do not reliably lazy-restart killed stdio MCP servers (or have unproven restart semantics) |
 
 **Idle is measured on the session, not on the server.** Some servers spend CPU
 on their own work, such as watching files, while no one calls them. A session
@@ -128,28 +146,35 @@ sleeping, every session's clock starts again.
 
 ### Idle Codex restart
 
-Owner decision 2026-10-06: agentwarden restarts the app when Codex is idle,
-because the Codex leak cannot be reclaimed in place. Defaults are fixed in
-code:
+Owner decision 2026-10-06 (extended to Antigravity/clones and OpenCode desktop
+apps): agentwarden restarts idle desktop agent apps as a whole because their
+leaked runtime and MCP pools cannot be reclaimed safely one by one. Defaults are
+fixed in code:
 
 | Condition | Default | Signal (no root needed, checked on the owner's machine) |
 | --- | --- | --- |
-| No Codex turn activity | 30 minutes | No `~/.codex/sessions/**/rollout-*.jsonl` modified, and nothing running under the app except MCP pool members: no shell, no `codex exec`, no command, however long it has run |
+| No agent turn activity | 30 minutes | Codex: no `~/.codex/sessions/**/rollout-*.jsonl` modified. Antigravity: no conversation/summary write in `~/.gemini/<--app_data_dir>` (default `antigravity`). OpenCode: no real session/message/part timestamp in `opencode.db` (via read-only `sqlite3`, ignoring background `kv` WAL ticks and `opencode.log`) or `prompt-history.jsonl` write. In all cases: nothing running under the app except MCP/runtime pool members — no shell, no TTY process, no `codex exec`, no nested external agent (`claude`, `codex`, `opencode`, `agy`), and no non-pool command |
 | Nobody at the machine | 30 minutes | HID idle time from `IOHIDSystem` |
-| Worth restarting | The Codex runtimes with everything under them hold ≥ 1 GB, or ≥ 512 MB under Warning or Critical pressure | Footprint (R4), pressure level |
-| Not too often | At most once per 6 hours | Action log |
+| Worth restarting | ≥ 1 GB, or ≥ 512 MB under Warning or Critical pressure | Footprint (R4), pressure level (Codex: runtimes subtree; Antigravity: app tree minus active commands; OpenCode: app tree + attached service minus active commands) |
+| Not too often | At most once per 6 hours per bundle | Persisted per-bundle restart timestamps |
 
-Restart sequence: ask the app to quit gracefully; if it has not exited within
-60 seconds, abort and record the refusal (never force-kill the app); relaunch
-it in the background without focus; the next pass reclaims helpers the quit
-left orphaned. If the app quits after the 60 seconds, or the relaunch fails,
-later passes open it again once it is gone, for up to 10 minutes; after that a
-closed app is taken as the user's choice.
+Restart sequence: ask the app to quit gracefully via SIGTERM; if it has not
+exited within 60 seconds, abort and record the refusal (never force-kill the
+app); for OpenCode (with no CLI client) or Antigravity, gracefully SIGTERM a
+lingering companion service/`language_server` (never SIGKILL); relaunch the
+exact `.app` bundle in the background without focus (`open -g -j -a <bundle>`);
+the next pass reclaims helpers the quit left orphaned. If the app quits after
+the 60 seconds, or the relaunch fails, later passes open that exact bundle again
+once it is gone, for up to 10 minutes; after that a closed app is taken as the
+user's choice.
 
-MCP pool members are children of a Codex runtime whose command line matches an
-MCP server in a configuration or whose executable is inside the app bundle.
-Any other child is a command: a shell that runs one command execs it, so a
-running `cargo test` is the runtime's own child. Pools that Codex starts by itself while idle
+MCP pool members are children of a runtime whose command line matches a
+configured MCP server (including package-runner forms such as `npx`/`uvx`/
+`npm exec`, discovered across Claude, Codex, Antigravity/Gemini + plugins,
+OpenCode, Cursor, Windsurf, Zed, VS Code, and project `.mcp.json` configs) or whose executable
+is inside the app bundle or its external runtime directory. Any other child is a
+command: a shell that runs one command execs it, so a running `cargo test` is
+the runtime's own child. Pools that an idle agent starts by itself
 ([openai/codex#43971](https://github.com/openai/codex/issues/43971)) therefore
 do not count as activity.
 
@@ -200,14 +225,30 @@ actions are outcomes in the log, not failures.
 - Before a signal, the PID is revalidated by start time and owner; a changed
   process is skipped.
 - Only the current user's processes are signalled, and agentwarden refuses to
-  run as root. System processes, shells, terminals, editors, and any process
-  with a TTY are never signalled; a helper with one of them, or an agent,
-  among its descendants is left alone with its whole tree. The
-  agent applications are never signalled either; the only exception is the
-  graceful quit in [idle Codex restart](#idle-codex-restart).
-- Stopping is SIGTERM, then SIGKILL after a grace period, to each process of
-  the tree, children first. Zombies are skipped: they have exited already.
-- Every stop appends one structured record to the action log.
+  run as root. System processes, shells, terminals, editors, VCS/system
+  utilities (`git`, `ssh`, `gpg`, etc.), and unrelated processes with a TTY are
+  never signalled; a helper tree containing a shell, an agent, or a protected
+  terminal process is left alone as a whole. Under `idle-claude-session`, an
+  idle TTY-attached `claude` CLI session's configured MCP helpers (and their
+  non-shell, non-agent worker descendants) carrying the exact controlling TTY
+  inherited from that parent `claude` session are permitted; processes on any
+  different TTY, direct non-helper TTY children, and any `orphan` candidate
+  with a TTY remain strictly protected.
+- Agent hosts and desktop applications are never signalled by `Stop` rules; the
+  only exceptions are provably orphaned desktop-bundled Antigravity
+  `language_server` processes (`ppid == 1`, `--host_bridge_url=`, non-launchd,
+  owning app exited or replaced), graceful SIGTERM-only shutdown in
+  `idle-opencode-service`, and graceful SIGTERM quit in
+  [idle desktop restart](#idle-codex-restart).
+- `Stop` sends SIGTERM, then SIGKILL after a 5 s grace period, to each process
+  of the tree, children first. `StopGraceful` and desktop app restarts send
+  SIGTERM only and never SIGKILL. Zombies are skipped: they have exited already.
+- In `reclaim` and `watch`, a `/usr/bin/top` failure or timeout degrades
+  non-fatally so `orphan`, `idle-claude-session`, pressure-idle
+  `idle-opencode-service`, and session observation still run while
+  footprint-gated restarts conservatively skip. A `/bin/ps` failure always aborts
+  the pass.
+- Every action appends one structured record to the action log.
 
 ## Accepted decisions
 

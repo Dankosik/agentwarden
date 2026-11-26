@@ -11,7 +11,9 @@ fn xml_escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Runs at login, restarts after a crash, at background priority.
+/// Runs at login, restarts after a crash, at low CPU priority (`Nice = 10`)
+/// without `ProcessType=Background` / `LowPriorityIO` so Darwin QoS throttling
+/// does not starve `ps`/`top` when the machine is swapping heavily.
 pub fn plist(exe: &Path, home: &Path) -> String {
     let exe = xml_escape(&exe.to_string_lossy());
     let log = xml_escape(&home.join("Library/Logs/agentwarden.log").to_string_lossy());
@@ -33,12 +35,8 @@ pub fn plist(exe: &Path, home: &Path) -> String {
 	<true/>
 	<key>ThrottleInterval</key>
 	<integer>60</integer>
-	<key>ProcessType</key>
-	<string>Background</string>
 	<key>Nice</key>
 	<integer>10</integer>
-	<key>LowPriorityIO</key>
-	<true/>
 	<key>StandardErrorPath</key>
 	<string>{log}</string>
 </dict>

@@ -7,6 +7,83 @@ section of the tagged version as its release notes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-27
+
+Dynamic multi-agent discovery across Antigravity (including renamed/proxy-wrapped
+clones such as `Antigravity US.app`), OpenCode, Codex (desktop apps, CLI, and
+nested subagents), Claude Code (desktop and terminal CLI), and any other coding
+IDE/CLI parenting configured MCP servers, plus reliability fixes under heavy
+memory pressure.
+
+### Added
+
+- **Dynamic desktop app discovery (`desktop_apps[]` in JSON and `status`):**
+  Discovers Codex (`ChatGPT.app`, `Codex.app`, clones), Antigravity
+  (`Antigravity.app`, `Antigravity US.app`, and arbitrarily renamed clones),
+  OpenCode (`OpenCode.app`), and generic MCP-hosting IDEs/apps (`other`, plus
+  Claude Desktop direct MCPs) by walking up from live runtimes and MCP helpers
+  rather than hardcoding app bundle paths.
+- **Standalone CLI, service, and nested subagent attribution (`agent_sessions[]`
+  in JSON and `status`):** Tracks `codex` / `codex exec`, `opencode`,
+  `opencode-cli serve --service`, `agy`, and generic MCP-hosting CLIs, including
+  nested subagent runs (`parent_agent`, e.g. Antigravity or Claude Code invoking
+  `codex`), recording their MCP helpers in `known_helpers` for orphan reaping
+  and blocking parent restarts/stops while a subagent is active.
+- **Rule `idle-antigravity-restart` (`kind: "restart-app"`):** Gracefully quits
+  an idle Antigravity desktop app (plus its `language_server` if it lingers) and
+  relaunches the exact `.app` bundle in the background, tracking each instance's
+  real `--app_data_dir` (`~/.gemini/<name>`) independently.
+- **Rules `idle-opencode-restart` (`kind: "restart-app"`) and
+  `idle-opencode-service` (`kind: "stop-graceful"`):** Gracefully stops a
+  headless `opencode-cli serve --service` (SIGTERM only, never SIGKILL) or
+  restarts an idle `OpenCode.app` using real SQLite session/message timestamps
+  from `opencode.db` + `prompt-history.jsonl` (ignoring 5-minute background `kv`
+  WAL ticks and `opencode.log`).
+- **Expanded orphan reaping:** Safely reaps orphaned Antigravity `sidecar_sdk`
+  processes, provably orphaned desktop-bundled Antigravity `language_server`
+  processes (`ppid == 1` with `--host_bridge_url=`), and childless `opencode-pty`
+  processes when no OpenCode client or service is alive.
+- **Expanded MCP configuration discovery:** Reads project `.mcp.json`,
+  `.codex/config.toml`, and `opencode.json[c]`; Claude and Codex plugin
+  `.mcp.json` caches; `claude_desktop_config.json`; `~/.gemini/antigravity*`
+  and custom `~/.gemini/<clone>/mcp_config.json` plus `~/.gemini/config/plugins/`;
+  `~/.config/opencode/opencode.json[c]` (including nested `"mcp.servers"`);
+  Zed `context_servers`; and VS Code `mcp.json`.
+
+### Changed
+
+- **Non-fatal `/usr/bin/top` degradation in `reclaim` and `watch`:** A `top`
+  timeout or failure under heavy swap logs a warning and continues without
+  footprints so `orphan`, `idle-claude-session`, pressure-idle
+  `idle-opencode-service`, and `state.observe()` still run (while footprint-gated
+  restarts conservatively skip).
+- **LaunchAgent QoS:** Removed `ProcessType=Background` and `LowPriorityIO`
+  (keeping `Nice=10`) from the LaunchAgent plist so Darwin QoS throttling does
+  not starve `ps`/`top` during heavy swapping.
+- **Terminal `claude` CLI support in `idle-claude-session`:** Reclaims configured
+  stdio MCP helper trees of idle TTY-attached `claude` CLI sessions on the exact
+  inherited controlling TTY while continuing to protect shells, interactive
+  terminal programs (`vim`, `fzf`, `less`, `tmux`, etc.), VCS utilities, other
+  TTYs, and any orphan with a TTY.
+
+### Fixed
+
+- **Codex restart blocked by generic-launcher MCPs and external helpers:**
+  Generic launchers with arguments (`npx`, `pnpx`, `bunx`, `uvx`, `pipx`, `node`,
+  `python3`, `python3.x`, macOS Framework `Python`, `docker`, `npm exec`, scoped
+  npm packages such as `@playwright/mcp@latest`) and external runtime helpers
+  (`codex-code-mode-host`, `node_repl`, `~/.codex/computer-use/`,
+  `~/.cache/codex-runtimes/`, `~/.codex/plugins/`) now classify as MCP pools
+  instead of running commands.
+- **False-positive `git` orphan stops:** VCS and system utilities (`git`,
+  `git-fsmonitor--daemon`, `ssh`, `gpg`, `watchman`, `caffeinate`, etc.) are
+  never added to `known_helpers` and never stopped by `orphan` or
+  `idle-claude-session`.
+- **Framework and browser bundle false protection:** Framework-embedded `.app`
+  bundles (such as Homebrew `Python.framework/.../Python.app`) and headless
+  browsers (such as Playwright `Chromium.app`) are no longer misclassified as
+  protected agent host apps.
+
 ## [0.1.3] - 2026-11-26
 
 Substantial CPU and memory optimizations for both the background `watch`
@@ -131,7 +208,8 @@ First release, for macOS on Apple Silicon and Intel.
 - `install.sh`: install or upgrade from GitHub Releases with checksum
   verification.
 
-[Unreleased]: https://github.com/Dankosik/agentwarden/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Dankosik/agentwarden/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Dankosik/agentwarden/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/Dankosik/agentwarden/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Dankosik/agentwarden/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Dankosik/agentwarden/compare/v0.1.0...v0.1.1

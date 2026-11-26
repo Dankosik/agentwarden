@@ -93,6 +93,8 @@ fn status_and_dry_run_report_json_and_write_nothing() {
             "user_idle_secs",
             "claude_sessions",
             "codex",
+            "desktop_apps",
+            "agent_sessions",
             "orphans",
             "planned",
             "applied",
