@@ -1,6 +1,9 @@
 //! What agentwarden remembers between passes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{self, Write as _},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -49,9 +52,16 @@ pub struct SessionActivity {
     pub active_at: u64,
 }
 
-/// Session keys are text so the state file stays plain JSON.
-pub fn session_key(identity: &Identity) -> String {
-    format!("{}@{}", identity.pid, identity.started)
+fn with_session_key<R>(pid: i32, started: &str, f: impl FnOnce(&str) -> R) -> R {
+    let mut stack = [0u8; 64];
+    let mut cursor = io::Cursor::new(&mut stack[..]);
+    if write!(cursor, "{pid}@{started}").is_ok() {
+        let len = cursor.position() as usize;
+        if let Ok(key) = std::str::from_utf8(&stack[..len]) {
+            return f(key);
+        }
+    }
+    f(&format!("{pid}@{started}"))
 }
 
 impl State {
@@ -71,57 +81,109 @@ impl State {
 
     /// Seconds the session has been idle, or `None` before it was first sampled
     /// and on the first pass after a gap, which proves nothing either way.
+    #[cfg(test)]
     pub fn session_idle_secs(&self, identity: &Identity, now: u64) -> Option<u64> {
-        self.sessions
-            .get(&session_key(identity))
-            .filter(|activity| now.saturating_sub(activity.sampled_at) <= SAMPLE_GAP_SECS)
-            .map(|activity| now.saturating_sub(activity.active_at))
+        self.session_idle_secs_for(identity.pid, &identity.started, now)
+    }
+
+    /// Zero-allocation lookup by `(pid, started)`.
+    pub fn session_idle_secs_for(&self, pid: i32, started: &str, now: u64) -> Option<u64> {
+        with_session_key(pid, started, |key| {
+            self.sessions
+                .get(key)
+                .filter(|activity| now.saturating_sub(activity.sampled_at) <= SAMPLE_GAP_SECS)
+                .map(|activity| now.saturating_sub(activity.active_at))
+        })
     }
 
     /// Record this pass. Call after rules were evaluated against the old state.
-    pub fn observe(&mut self, snapshot: &Snapshot, ownership: &Ownership<'_>) {
+    /// Returns whether any persisted field changed.
+    pub fn observe(&mut self, snapshot: &Snapshot, ownership: &Ownership) -> bool {
         let now = snapshot.taken_at;
-        let alive: BTreeSet<Identity> = snapshot.processes.iter().map(|p| p.identity()).collect();
-        self.known_helpers
-            .retain(|identity| alive.contains(identity));
-        self.known_helpers.extend(ownership.helper_identities());
+        let helpers_before = self.known_helpers.len();
+        self.known_helpers.retain(|identity| {
+            ownership
+                .process(snapshot, identity.pid)
+                .is_some_and(|process| snapshot.started(process) == identity.started)
+        });
+        let helpers_after_retain = self.known_helpers.len();
+        ownership.extend_helper_identities(snapshot, &mut self.known_helpers);
+        let mut changed = helpers_after_retain != helpers_before
+            || self.known_helpers.len() != helpers_after_retain;
 
-        let mut sessions = BTreeMap::new();
-        for session in &ownership.claude_sessions {
-            let Some(process) = ownership.process(session.pid) else {
-                continue;
-            };
-            let key = session_key(&process.identity());
-            let activity = match self.sessions.get(&key) {
-                Some(previous) => {
-                    let elapsed = now.saturating_sub(previous.sampled_at).max(1);
-                    let spent = process.cpu_centis.saturating_sub(previous.cpu_centis);
-                    // A process started since the last pass is a tool call, even
-                    // when it cost the session itself little CPU.
-                    let started_something = ownership
-                        .descendants(session.pid)
-                        .into_iter()
-                        .filter_map(|pid| ownership.process(pid))
-                        .any(|child| child.age_secs <= elapsed);
-                    let busy = elapsed > SAMPLE_GAP_SECS
-                        || started_something
-                        || spent * 60 > IDLE_CPU_CENTIS_PER_MINUTE * elapsed;
-                    SessionActivity {
-                        cpu_centis: process.cpu_centis,
-                        sampled_at: now,
-                        active_at: if busy { now } else { previous.active_at },
+        if !self.sessions.is_empty() || !ownership.claude_sessions.is_empty() {
+            if ownership.claude_sessions.is_empty() {
+                if !self.sessions.is_empty() {
+                    self.sessions.clear();
+                    changed = true;
+                }
+            } else {
+                // Update existing sessions in place so steady-state passes with
+                // live Claude sessions allocate zero `BTreeMap` nodes.
+                let prev_len = self.sessions.len();
+                let mut existing_matched = 0usize;
+                for session in &ownership.claude_sessions {
+                    let Some(process) = ownership.process(snapshot, session.pid) else {
+                        continue;
+                    };
+                    let mut inserted = None;
+                    with_session_key(process.pid, snapshot.started(process), |key_str| {
+                        if let Some(previous) = self.sessions.get_mut(key_str) {
+                            existing_matched += 1;
+                            let elapsed = now.saturating_sub(previous.sampled_at).max(1);
+                            let spent = process.cpu_centis.saturating_sub(previous.cpu_centis);
+                            // A process started since the last pass is a tool call, even
+                            // when it cost the session itself little CPU.
+                            let busy = elapsed > SAMPLE_GAP_SECS
+                                || spent * 60 > IDLE_CPU_CENTIS_PER_MINUTE * elapsed
+                                || ownership.any_descendant(snapshot, session.pid, |child| {
+                                    child.age_secs <= elapsed
+                                });
+                            let next = SessionActivity {
+                                cpu_centis: process.cpu_centis,
+                                sampled_at: now,
+                                active_at: if busy { now } else { previous.active_at },
+                            };
+                            if next != *previous {
+                                *previous = next;
+                                changed = true;
+                            }
+                        } else {
+                            changed = true;
+                            inserted = Some((
+                                key_str.to_owned(),
+                                SessionActivity {
+                                    cpu_centis: process.cpu_centis,
+                                    sampled_at: now,
+                                    active_at: now,
+                                },
+                            ));
+                        }
+                    });
+                    if let Some((key, activity)) = inserted {
+                        self.sessions.insert(key, activity);
                     }
                 }
-                None => SessionActivity {
-                    cpu_centis: process.cpu_centis,
-                    sampled_at: now,
-                    active_at: now,
-                },
-            };
-            sessions.insert(key, activity);
+                if existing_matched < prev_len {
+                    // At least one previously tracked session exited; drop only
+                    // keys that are no longer among live Claude sessions.
+                    self.sessions.retain(|key, _| {
+                        ownership.claude_sessions.iter().any(|session| {
+                            ownership.process(snapshot, session.pid).is_some_and(|p| {
+                                with_session_key(p.pid, snapshot.started(p), |k| k == key)
+                            })
+                        })
+                    });
+                    changed = true;
+                }
+            }
         }
-        self.sessions = sessions;
-        self.last_swap_used_bytes = Some(snapshot.swap.used_bytes);
+        let next_swap = Some(snapshot.swap.used_bytes);
+        if self.last_swap_used_bytes != next_swap {
+            self.last_swap_used_bytes = next_swap;
+            changed = true;
+        }
+        changed
     }
 }
 
@@ -163,12 +225,7 @@ mod tests {
             let ownership = Ownership::new(snapshot, &BTreeSet::new());
             state.observe(snapshot, &ownership);
         };
-        let session = snapshot
-            .processes
-            .iter()
-            .find(|p| p.pid == 110)
-            .unwrap()
-            .identity();
+        let session = snapshot.identity(snapshot.processes.iter().find(|p| p.pid == 110).unwrap());
         // Its shell and command started long ago; ages stay fixed in this fixture.
         for process in &mut snapshot.processes {
             if [113, 114].contains(&process.pid) {
@@ -235,12 +292,7 @@ mod tests {
             let ownership = Ownership::new(snapshot, &BTreeSet::new());
             state.observe(snapshot, &ownership);
         };
-        let session = snapshot
-            .processes
-            .iter()
-            .find(|p| p.pid == 120)
-            .unwrap()
-            .identity();
+        let session = snapshot.identity(snapshot.processes.iter().find(|p| p.pid == 120).unwrap());
         observe(&mut state, &snapshot);
         for _ in 0..10 {
             snapshot.taken_at += 66;
@@ -268,14 +320,15 @@ mod tests {
             observe(&mut state, &snapshot);
         }
         snapshot.taken_at += 60;
-        snapshot.processes.push(crate::owners::tests::proc(
+        crate::owners::tests::add_proc(
+            &mut snapshot,
             125,
             120,
             "/opt/homebrew/bin/gopls",
             "gopls mcp",
             20,
             50,
-        ));
+        );
         observe(&mut state, &snapshot);
         assert_eq!(
             state.session_idle_secs(&session, snapshot.taken_at),
@@ -289,12 +342,7 @@ mod tests {
         let mut state = State::default();
         let ownership = Ownership::new(&snapshot, &BTreeSet::new());
         state.observe(&snapshot, &ownership);
-        let session = snapshot
-            .processes
-            .iter()
-            .find(|p| p.pid == 120)
-            .unwrap()
-            .identity();
+        let session = snapshot.identity(snapshot.processes.iter().find(|p| p.pid == 120).unwrap());
         // 0.6 s in 66 s is above 0.5 s per minute: working.
         snapshot.taken_at += 66;
         snapshot
@@ -310,5 +358,93 @@ mod tests {
             state.session_idle_secs(&session, snapshot.taken_at),
             Some(60)
         );
+    }
+
+    #[test]
+    fn observe_reports_changes_accurately_and_handles_long_session_keys() {
+        let mut snapshot = crate::model::Snapshot {
+            taken_at: 1000,
+            user: 501,
+            swap: Swap {
+                used_bytes: 1 << 30,
+                total_bytes: 2 << 30,
+            },
+            ..Default::default()
+        };
+        let mut state = State::default();
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        // First observe sets last_swap_used_bytes.
+        assert!(state.observe(&snapshot, &ownership));
+        // Identical pass reports no change.
+        snapshot.taken_at += 60;
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert!(!state.observe(&snapshot, &ownership));
+
+        // Swap change reports changed.
+        snapshot.swap.used_bytes += 4096;
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert!(state.observe(&snapshot, &ownership));
+        assert!(!state.observe(&snapshot, &ownership));
+
+        // Long `started` string (> 64 bytes) exercises the heap fallback in `with_session_key`.
+        let long_started = "x".repeat(80);
+        snapshot.push_process(
+            500,
+            1,
+            501,
+            &long_started,
+            100,
+            false,
+            0,
+            Some(10 << 20),
+            "/bin/claude",
+            "claude",
+        );
+        let id = snapshot.identity(snapshot.processes.last().unwrap());
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert!(state.observe(&snapshot, &ownership));
+        assert_eq!(state.session_idle_secs(&id, snapshot.taken_at), Some(0));
+
+        // Simultaneous exit of session 500 and arrival of session 501 in the same pass
+        // (same timestamp!) must drop 500 and keep 501.
+        snapshot.processes.clear();
+        crate::owners::tests::add_proc(&mut snapshot, 501, 1, "/bin/claude", "claude", 10, 10);
+        let id_new = snapshot.identity(snapshot.processes.last().unwrap());
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert!(state.observe(&snapshot, &ownership));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.session_idle_secs(&id, snapshot.taken_at), None);
+        assert_eq!(state.session_idle_secs(&id_new, snapshot.taken_at), Some(0));
+
+        // Removing the session reports changed.
+        snapshot.processes.clear();
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert!(state.observe(&snapshot, &ownership));
+        assert!(state.sessions.is_empty());
+
+        // Duplicate PIDs in a synthetic snapshot must not prevent pruning an exited session.
+        crate::owners::tests::add_proc(&mut snapshot, 600, 1, "/bin/claude", "claude", 10, 10);
+        crate::owners::tests::add_proc(&mut snapshot, 601, 1, "/bin/claude", "claude", 10, 10);
+        let id_600 = snapshot.identity(&snapshot.processes[0]);
+        let id_601 = snapshot.identity(&snapshot.processes[1]);
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert!(state.observe(&snapshot, &ownership));
+        assert_eq!(state.sessions.len(), 2);
+
+        snapshot.processes.clear();
+        // Session 601 exited; session 600 appears twice in an unsorted fixture.
+        crate::owners::tests::add_proc(&mut snapshot, 600, 1, "/bin/claude", "claude", 70, 10);
+        crate::owners::tests::add_proc(&mut snapshot, 600, 1, "/bin/claude", "claude", 70, 10);
+        snapshot.taken_at += 60;
+        let ownership = Ownership::new(&snapshot, &BTreeSet::new());
+        assert_eq!(ownership.claude_sessions.len(), 1);
+        assert!(state.observe(&snapshot, &ownership));
+        assert_eq!(state.sessions.len(), 1);
+        assert!(
+            state
+                .session_idle_secs(&id_600, snapshot.taken_at)
+                .is_some()
+        );
+        assert_eq!(state.session_idle_secs(&id_601, snapshot.taken_at), None);
     }
 }

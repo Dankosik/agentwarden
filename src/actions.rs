@@ -1,10 +1,14 @@
 //! Carry out planned actions safely and record what happened.
 
 use std::{
+    collections::BTreeSet,
     io,
     path::{Path, PathBuf},
     time::Duration,
 };
+
+use compact_str::CompactString;
+use smallvec::SmallVec;
 
 use crate::{
     error::AppError,
@@ -29,8 +33,36 @@ pub enum Signal {
 /// Everything agentwarden needs from the operating system.
 pub trait System {
     fn snapshot(&self) -> Result<Snapshot, AppError>;
+    /// Base pass sample without optional expensive probes (Codex rollout scan,
+    /// process footprints; HID idle only when `include_user_idle` is true).
+    /// Implementations with lazy probes override this and the `resolve_*`
+    /// methods below.
+    fn begin_pass(
+        &self,
+        _known_helpers: &BTreeSet<Identity>,
+        _include_user_idle: bool,
+    ) -> Result<Snapshot, AppError> {
+        self.snapshot()
+    }
+    /// Seconds since keyboard/pointer input; defaults to what `snapshot` holds.
+    fn user_idle_secs(&self, snapshot: &Snapshot) -> Option<u64> {
+        snapshot.user_idle_secs
+    }
+    /// Newest Codex rollout write; when `early_exit_after` is `Some(cutoff)`,
+    /// an implementation may stop scanning once it finds a write `> cutoff`.
+    fn codex_activity_at(
+        &self,
+        snapshot: &Snapshot,
+        _early_exit_after: Option<u64>,
+    ) -> Option<u64> {
+        snapshot.codex_activity_at
+    }
+    /// Populate `footprint_bytes` on `snapshot.processes` when not already set.
+    fn resolve_footprints(&self, _snapshot: &mut Snapshot) -> Result<(), AppError> {
+        Ok(())
+    }
     /// Start time and owner of a live process, or `None` when it is gone.
-    fn identify(&self, pid: i32) -> Option<(String, u32)>;
+    fn identify(&self, pid: i32) -> Option<(CompactString, u32)>;
     fn signal(&self, pid: i32, signal: Signal) -> io::Result<()>;
     /// Start an application bundle in the background without taking focus.
     fn launch_app(&self, bundle: &Path) -> io::Result<()>;
@@ -66,10 +98,11 @@ fn is_same(system: &dyn System, identity: &Identity, user: u32) -> bool {
         .is_some_and(|(started, owner)| started == identity.started && owner == user)
 }
 
-fn wait_gone(system: &dyn System, targets: &[&Target], user: u32, limit: Duration) -> bool {
+fn wait_gone(system: &dyn System, targets: &mut Vec<&Target>, user: u32, limit: Duration) -> bool {
     let mut waited = Duration::ZERO;
     loop {
-        if targets.iter().all(|t| !is_same(system, &t.identity, user)) {
+        targets.retain(|t| is_same(system, &t.identity, user));
+        if targets.is_empty() {
             return true;
         }
         if waited >= limit {
@@ -96,25 +129,25 @@ fn stop(
         record.detail = Some("process changed or exited before the stop".into());
         return record;
     }
-    let live: Vec<&Target> = tree
-        .iter()
-        .filter(|t| is_same(system, &t.identity, user))
-        .collect();
+    let mut live: Vec<&Target> = if tree.len() == 1 && tree[0].identity == root.identity {
+        vec![&tree[0]]
+    } else {
+        tree.iter()
+            .filter(|t| t.identity == root.identity || is_same(system, &t.identity, user))
+            .collect()
+    };
     for target in &live {
         let _ = system.signal(target.identity.pid, Signal::Term);
     }
-    if wait_gone(system, &live, user, STOP_GRACE) {
+    if wait_gone(system, &mut live, user, STOP_GRACE) {
         record.outcome = Outcome::Stopped;
         return record;
     }
-    let stubborn: Vec<&Target> = live
-        .into_iter()
-        .filter(|t| is_same(system, &t.identity, user))
-        .collect();
-    for target in &stubborn {
+    // `wait_gone` just revalidated `live` on its final check.
+    for target in &live {
         let _ = system.signal(target.identity.pid, Signal::Kill);
     }
-    if wait_gone(system, &stubborn, user, KILL_GRACE) {
+    if wait_gone(system, &mut live, user, KILL_GRACE) {
         record.outcome = Outcome::Stopped;
         record.detail = Some("needed SIGKILL".into());
     } else {
@@ -150,7 +183,8 @@ fn restart(
         return record;
     }
     // Never force the app: an app that does not quit is left as it is.
-    if !wait_gone(system, &[app], user, APP_QUIT_TIMEOUT) {
+    let mut live = vec![app];
+    if !wait_gone(system, &mut live, user, APP_QUIT_TIMEOUT) {
         record.outcome = Outcome::Refused;
         record.detail = Some(QUIT_TIMED_OUT.into());
         return record;
@@ -183,13 +217,15 @@ pub fn left_quit(action: &Action, record: &Record) -> Option<PathBuf> {
 pub fn relaunch(system: &dyn System, bundle: &Path) -> Record {
     let name = bundle
         .file_stem()
-        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+        .map_or_else(CompactString::default, |stem| {
+            CompactString::from(stem.to_string_lossy().as_ref())
+        });
     let mut record = Record {
         at: system.now(),
-        rule: "idle-codex-restart".into(),
+        rule: CompactString::const_new("idle-codex-restart"),
         outcome: Outcome::Restarted,
         target: name,
-        pids: Vec::new(),
+        pids: SmallVec::new(),
         footprint_bytes: 0,
         reason: "relaunch after the app quit late".into(),
         detail: None,
@@ -215,11 +251,9 @@ fn record(
     footprint_bytes: u64,
     reason: &str,
 ) -> Record {
-    let rule = serde_json::to_value(rule)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default();
-    let mut pids: Vec<i32> = tree.iter().map(|t| t.identity.pid).collect();
+    let rule = CompactString::const_new(rule.as_str());
+    let mut pids: SmallVec<[i32; 4]> = SmallVec::with_capacity(tree.len().max(1));
+    pids.extend(tree.iter().map(|t| t.identity.pid));
     if pids.is_empty() {
         pids.push(root.identity.pid);
     }
@@ -245,6 +279,8 @@ pub(crate) mod tests {
         time::Duration,
     };
 
+    use compact_str::{CompactString, format_compact};
+
     use super::{Signal, System, app_bundle, execute};
     use crate::{
         error::AppError,
@@ -257,7 +293,7 @@ pub(crate) mod tests {
     /// `immortal` ignore everything.
     #[derive(Default)]
     pub(crate) struct FakeSystem {
-        pub alive: RefCell<BTreeMap<i32, (String, u32)>>,
+        pub alive: RefCell<BTreeMap<i32, (CompactString, u32)>>,
         pub stubborn: BTreeSet<i32>,
         pub immortal: BTreeSet<i32>,
         pub signals: RefCell<Vec<(i32, Signal)>>,
@@ -269,7 +305,7 @@ pub(crate) mod tests {
         fn snapshot(&self) -> Result<Snapshot, AppError> {
             Ok(Snapshot::default())
         }
-        fn identify(&self, pid: i32) -> Option<(String, u32)> {
+        fn identify(&self, pid: i32) -> Option<(CompactString, u32)> {
             self.alive.borrow().get(&pid).cloned()
         }
         fn signal(&self, pid: i32, signal: Signal) -> io::Result<()> {
@@ -297,7 +333,7 @@ pub(crate) mod tests {
         Target {
             identity: Identity {
                 pid,
-                started: format!("start-{pid}"),
+                started: format_compact!("start-{pid}"),
             },
             exe_name: "node".into(),
         }
@@ -309,7 +345,7 @@ pub(crate) mod tests {
             system
                 .alive
                 .borrow_mut()
-                .insert(*pid, (format!("start-{pid}"), 501));
+                .insert(*pid, (format_compact!("start-{pid}"), 501));
         }
         system
     }
@@ -329,7 +365,7 @@ pub(crate) mod tests {
         let system = system(&[401, 400]);
         let records = execute(&system, &[stop_tree(&[401, 400])], 501);
         assert_eq!(records[0].outcome, Outcome::Stopped);
-        assert_eq!(records[0].pids, [401, 400]);
+        assert_eq!(records[0].pids.as_slice(), [401, 400]);
         assert_eq!(
             *system.signals.borrow(),
             [(401, Signal::Term), (400, Signal::Term)]
@@ -359,7 +395,7 @@ pub(crate) mod tests {
         system
             .alive
             .borrow_mut()
-            .insert(pid, (format!("start-{pid}"), uid));
+            .insert(pid, (format_compact!("start-{pid}"), uid));
         system
     }
 

@@ -7,6 +7,42 @@ section of the tagged version as its release notes.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-26
+
+Substantial CPU and memory optimizations for both the background `watch`
+daemon and interactive `status`/`reclaim` runs, without changing the CLI,
+JSON schema, or reclamation rules.
+
+### Changed
+
+- Reduced sleeping `watch` physical memory footprint from ~3.8 MB to ~1.1 MB
+  (cutting dirty `MALLOC_SMALL` pages by >95 %) through streaming line-by-line
+  subprocess parsing, stack-buffered SIMD-accelerated (`memchr`) TOML/JSON
+  MCP config readers, a flat `Snapshot` string arena, inline `CompactString`
+  and `SmallVec` storage, minimal probe environments, and skipping `clap` /
+  `stdout` initialization on bare `agentwarden watch`.
+- Reduced `status` wall time and CPU by ~10× and steady-state `watch` CPU by
+  ~75× by running system probes concurrently in a single `poll` loop,
+  resolving `top` footprints, `ioreg` idle time, and `~/.codex/sessions`
+  walks lazily only when needed, caching unchanged `state.json`, MCP configs,
+  `launchd` jobs, and verified non-MCP `ppid == 1` processes across `watch`
+  passes, short-circuiting `identify` with `kill(pid, 0)`, and skipping
+  redundant `state.json` rewrites when nothing changed.
+- Enabled fat LTO, single codegen unit, `panic = "abort"`, and symbol
+  stripping for release builds.
+
+### Fixed
+
+- `top` PID architecture suffixes (`*`, `+`, `-`, such as Rosetta 2
+  processes on Apple Silicon) are now parsed instead of silently dropping
+  process footprints.
+- Transient open errors when reading `~/.codex/config.toml`,
+  `~/.claude.json`, or saving `state.json` no longer poison in-memory caches
+  across `watch` passes.
+- `ChatGPT.app` without active Codex runtimes and Claude Code sessions
+  without helpers no longer trigger unnecessary `top`, `ioreg`, or
+  `~/.codex/sessions` probes.
+
 ## [0.1.2] - 2026-10-06
 
 ### Fixed
@@ -95,7 +131,8 @@ First release, for macOS on Apple Silicon and Intel.
 - `install.sh`: install or upgrade from GitHub Releases with checksum
   verification.
 
-[Unreleased]: https://github.com/Dankosik/agentwarden/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Dankosik/agentwarden/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Dankosik/agentwarden/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Dankosik/agentwarden/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Dankosik/agentwarden/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Dankosik/agentwarden/releases/tag/v0.1.0

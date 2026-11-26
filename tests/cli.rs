@@ -57,6 +57,17 @@ fn there_is_no_configuration_flag() {
     assert_eq!(output.status.code(), Some(2));
 }
 
+#[test]
+fn invalid_format_env_is_still_rejected_for_watch() {
+    let home = tempfile::tempdir().unwrap();
+    let output = command(home.path())
+        .env("AGENTWARDEN_FORMAT", "bogus")
+        .arg("watch")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn status_and_dry_run_report_json_and_write_nothing() {

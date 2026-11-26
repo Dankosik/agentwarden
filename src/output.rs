@@ -10,7 +10,8 @@ pub(crate) fn report(
     let bytes = match format {
         Format::Text => crate::report::text(report).into_bytes(),
         Format::Json => {
-            let mut bytes = serde_json::to_vec(report)?;
+            let mut bytes = Vec::with_capacity(1024);
+            serde_json::to_writer(&mut bytes, report)?;
             bytes.push(b'\n');
             bytes
         }
@@ -19,7 +20,11 @@ pub(crate) fn report(
 }
 
 pub(crate) fn line(writer: &mut impl Write, text: &str) -> Result<(), AppError> {
-    write_bytes(writer, format!("{text}\n").as_bytes())
+    writer
+        .write_all(text.as_bytes())
+        .map_err(AppError::Output)?;
+    writer.write_all(b"\n").map_err(AppError::Output)?;
+    writer.flush().map_err(AppError::Output)
 }
 
 pub(crate) fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<(), AppError> {
