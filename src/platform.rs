@@ -2861,10 +2861,10 @@ pub mod macos {
         use std::{fs, time::Duration};
 
         use super::{
-            LineSplitter, MacOs, arg_candidate_pids, codex_activity_at, run_lines,
-            run_lines_with_timeout,
+            LineSplitter, MacOs, arg_candidate_pids, codex_activity_at, getuid,
+            ppid1_ag_or_app_check_flags, run_lines, run_lines_with_timeout, with_line_str,
         };
-        use crate::{actions::System, error::AppError, model::Snapshot};
+        use crate::{actions::System, error::AppError, model::Snapshot, owners, probe};
 
         #[test]
         fn poll_runner_drains_large_pipe_and_enforces_timeout() {
@@ -3183,6 +3183,59 @@ pub mod macos {
             let mac = MacOs::new(home.path().to_owned());
             let known = std::collections::BTreeSet::new();
 
+            // On freshly booted ephemeral CI VMs (< ORPHAN_MIN_AGE_SECS old),
+            // every user-owned `ppid == 1` process is still inside the 120s
+            // orphan grace window and intentionally filtered before caching.
+            // Probe eligible candidates *before* Pass 1 so monotonic age cannot
+            // race across the 120s boundary between Pass 1 and the assertion.
+            let has_eligible_ppid1_candidate = {
+                let mut found = false;
+                let user = getuid().as_raw();
+                let _ = run_lines(
+                    "/bin/ps",
+                    &[
+                        "-axww",
+                        "-o",
+                        "pid=,ppid=,uid=,tty=,state=,time=,etime=,lstart=,comm=",
+                    ],
+                    |bytes| {
+                        if found {
+                            return;
+                        }
+                        with_line_str(bytes, |line| {
+                            let Some(row) = probe::parse_ps_line(line) else {
+                                return;
+                            };
+                            if row.zombie
+                                || row.ppid != 1
+                                || row.uid != user
+                                || row.has_tty
+                                || row.age_secs < owners::ORPHAN_MIN_AGE_SECS
+                            {
+                                return;
+                            }
+                            let is_agent = owners::is_agent_or_app_candidate_exe(row.exe);
+                            let (is_ag_srv, is_app_exe) = ppid1_ag_or_app_check_flags(row.exe);
+                            if (is_agent && (is_ag_srv || is_app_exe))
+                                || (!is_agent
+                                    && !owners::is_opencode_pty_exe(row.exe)
+                                    && owners::is_orphan_base_candidate_fields(
+                                        row.ppid,
+                                        row.uid,
+                                        row.has_tty,
+                                        row.age_secs,
+                                        row.exe,
+                                        user,
+                                    ))
+                            {
+                                found = true;
+                            }
+                        });
+                    },
+                );
+                found
+            };
+
             // Pass 1 seeds launchd and non-MCP caches.
             let snap1 = mac.begin_pass(&known, false).unwrap();
             assert!(snap1.launchd_jobs.is_some());
@@ -3196,10 +3249,12 @@ pub mod macos {
                     cache.non_mcp_generation,
                 )
             };
-            assert!(
-                launchd_count_1 > 0 || non_mcp_count_1 > 0,
-                "live macOS host should seed launchd or non-MCP ppid==1 entries"
-            );
+            if has_eligible_ppid1_candidate {
+                assert!(
+                    launchd_count_1 > 0 || non_mcp_count_1 > 0,
+                    "live macOS host with eligible ppid==1 processes should seed launchd or non-MCP entries"
+                );
+            }
 
             // Pass 2 reuses the caches without rebuilding from scratch.
             let snap2 = mac.begin_pass(&known, false).unwrap();
