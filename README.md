@@ -1,9 +1,28 @@
-# agentwarden
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Dankosik/agentwarden/main/.github/assets/logo.png" alt="agentwarden logo" width="180" />
+</p>
 
-[![CI](https://github.com/Dankosik/agentwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/Dankosik/agentwarden/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Dankosik/agentwarden?sort=semver)](https://github.com/Dankosik/agentwarden/releases/latest)
-[![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](#install)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+<h1 align="center">agentwarden</h1>
+
+<p align="center">
+  <strong>Keeps a Mac running many AI coding agents from filling memory with idle MCP servers and orphaned helpers.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Dankosik/agentwarden/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Dankosik/agentwarden/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Dankosik/agentwarden/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Dankosik/agentwarden?sort=semver"></a>
+  <a href="#install"><img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-lightgrey"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#what-it-does">What it does</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#versions">Versions</a>
+</p>
+
+---
 
 Keeps a Mac that runs many AI coding agents (Claude Code, Codex, Antigravity,
 OpenCode) from filling its memory with idle agent helpers. Install it once; it
